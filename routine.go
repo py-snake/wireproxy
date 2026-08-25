@@ -42,8 +42,14 @@ type CredentialValidator struct {
 	password string
 }
 
-// VirtualTun stores a reference to netstack network and DNS configuration
+// VirtualTun stores a reference to a network (netstack or tailnet) and DNS configuration
 type VirtualTun struct {
+	// Name identifies this connection in logs and health endpoints
+	Name string
+	// Net is the dial/listen surface used by proxy routines
+	Net Network
+	// Tnet is the raw gVisor netstack; it is only set for WireGuard
+	// connections and is used for ICMP ping probes.
 	Tnet          *netstack.Net
 	Dev           *device.Device
 	SystemDNS     bool
@@ -52,6 +58,16 @@ type VirtualTun struct {
 	// PingRecord stores the last time an IP was pinged
 	PingRecord     map[string]uint64
 	PingRecordLock *sync.Mutex
+}
+
+// Logf logs a message prefixed with the connection name.
+func (d VirtualTun) Logf(format string, args ...interface{}) {
+	log.Printf("[%s] "+format, append([]interface{}{d.Name}, args...)...)
+}
+
+// Errorf logs an error message prefixed with the connection name.
+func (d VirtualTun) Errorf(format string, args ...interface{}) {
+	errorLogger.Printf("[%s] "+format, append([]interface{}{d.Name}, args...)...)
 }
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
@@ -70,7 +86,7 @@ func (d VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, erro
 	if d.SystemDNS {
 		return net.DefaultResolver.LookupHost(ctx, name)
 	}
-	return d.Tnet.LookupContextHost(ctx, name)
+	return d.Net.LookupContextHost(ctx, name)
 }
 
 // ResolveAddrWithContext resolves a hostname and returns an AddrPort.
@@ -172,7 +188,7 @@ func (passthroughResolver) Resolve(ctx context.Context, name string) (context.Co
 func (d VirtualTun) RoutedDial(router *DomainRouter) func(network, address string) (net.Conn, error) {
 	return func(network, address string) (net.Conn, error) {
 		if router.route(hostFromAddr(address)) {
-			return d.Tnet.Dial(network, address)
+			return d.Net.Dial(network, address)
 		}
 		return net.Dial(network, address)
 	}
@@ -188,7 +204,7 @@ func (d VirtualTun) routedSocks5Dial(router *DomainRouter) func(context.Context,
 			host = hostFromAddr(address)
 		}
 		if router.route(host) {
-			return d.Tnet.DialContext(ctx, network, address)
+			return d.Net.DialContext(ctx, network, address)
 		}
 		var dialer net.Dialer
 		return dialer.DialContext(ctx, network, address)
@@ -214,7 +230,7 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 	if len(config.TunnelDomains) == 0 && !config.LogDomains {
 		// Legacy path: everything through the tunnel, resolved via tunnel DNS.
 		options = append(options,
-			socks5.WithDial(vt.Tnet.DialContext),
+			socks5.WithDial(vt.Net.DialContext),
 			socks5.WithResolver(vt),
 		)
 	} else {
@@ -283,7 +299,7 @@ func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
 
-	sconn, err := vt.Tnet.DialTCP(tcpAddr)
+	sconn, err := vt.Net.DialTCP(tcpAddr)
 	if err != nil {
 		errorLogger.Printf("TCP Client Tunnel to %s: %s\n", target, err.Error())
 		return
@@ -302,7 +318,7 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input *os.File, output 
 	}
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := vt.Tnet.DialTCP(tcpAddr)
+	sconn, err := vt.Net.DialTCP(tcpAddr)
 	if err != nil {
 		errorLogger.Printf("TCP Client Tunnel to %s (%s): %s\n", target, tcpAddr, err.Error())
 		return
@@ -372,7 +388,7 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	}
 
 	addr := &net.TCPAddr{Port: conf.ListenPort}
-	server, err := vt.Tnet.ListenTCP(addr)
+	server, err := vt.Net.ListenTCP(addr)
 	if err != nil {
 		log.Fatal(err)
 	}

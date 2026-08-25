@@ -85,7 +85,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		}
 
 		// Create a new session
-		remoteConn, err := vt.Tnet.Dial("udp", conf.Target)
+		remoteConn, err := vt.Net.Dial("udp", conf.Target)
 		if err != nil {
 			return nil, fmt.Errorf("UDPProxyTunnel: could not Dial(%s): %w", conf.Target, err)
 		}

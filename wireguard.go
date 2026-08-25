@@ -2,7 +2,9 @@ package wireproxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"net"
 	"sync"
 
 	"net/netip"
@@ -19,6 +21,32 @@ type DeviceSetting struct {
 	DNS        []netip.Addr
 	DeviceAddr []netip.Addr
 	MTU        int
+}
+
+// netstackNetwork adapts the WireGuard gVisor netstack to the Network
+// interface used by proxy routines.
+type netstackNetwork struct {
+	tnet *netstack.Net
+}
+
+func (n *netstackNetwork) Dial(network, address string) (net.Conn, error) {
+	return n.tnet.Dial(network, address)
+}
+
+func (n *netstackNetwork) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return n.tnet.DialContext(ctx, network, address)
+}
+
+func (n *netstackNetwork) DialTCP(addr *net.TCPAddr) (net.Conn, error) {
+	return n.tnet.DialTCP(addr)
+}
+
+func (n *netstackNetwork) ListenTCP(addr *net.TCPAddr) (net.Listener, error) {
+	return n.tnet.ListenTCP(addr)
+}
+
+func (n *netstackNetwork) LookupContextHost(ctx context.Context, host string) ([]string, error) {
+	return n.tnet.LookupContextHost(ctx, host)
 }
 
 // CreateIPCRequest serialize the config into an IPC request and DeviceSetting
@@ -101,7 +129,9 @@ func StartWireguard(conf *Configuration, logLevel int) (*VirtualTun, error) {
 		}
 	}
 	return &VirtualTun{
+		Name:           conf.Name,
 		Tnet:           tnet,
+		Net:            &netstackNetwork{tnet: tnet},
 		Dev:            dev,
 		Conf:           deviceConf,
 		ResolveConfig:  conf.Resolve,

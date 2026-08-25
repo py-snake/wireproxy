@@ -86,9 +86,17 @@ type ResolveConfig struct {
 }
 
 type Configuration struct {
-	Device   *DeviceConfig
-	Routines []RoutineSpawner
-	Resolve  *ResolveConfig
+	// Name is the unique identifier of this connection (used in logs and
+	// the aggregated health endpoint).
+	Name string
+	// Device holds the WireGuard device configuration. Mutually exclusive
+	// with Tailscale.
+	Device *DeviceConfig
+	// Tailscale holds an embedded tsnet node configuration. Mutually
+	// exclusive with Device.
+	Tailscale *TailscaleConfig
+	Routines  []RoutineSpawner
+	Resolve   *ResolveConfig
 }
 
 func parseString(section *ini.Section, keyName string) (string, error) {
@@ -558,7 +566,7 @@ func parseResolveConfig(section *ini.Section) (*ResolveConfig, error) {
 
 	resolvStrategy, _ := parseString(section, "ResolveStrategy")
 	config.ResolveStrategy = resolvStrategy
-  
+
 	return config, nil
 }
 
@@ -694,9 +702,9 @@ func ParseConfig(path string) (*Configuration, error) {
 		resolve, err = parseResolveConfig(resolveSection)
 		if err != nil {
 			return nil, err
-	  }
-  }
-    
+		}
+	}
+
 	err = parseRoutinesConfig(&routinesSpawners, cfg, "UDPProxyTunnel", parseUDPProxyTunnelConfig)
 	if err != nil {
 		return nil, err
