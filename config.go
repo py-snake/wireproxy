@@ -618,8 +618,36 @@ func parseRoutinesConfig(routines *[]RoutineSpawner, cfg *ini.File, sectionName 
 	return nil
 }
 
-// ParseConfig takes the path of a configuration file and parses it into Configuration
+// ParseConfig takes the path of a configuration file and parses it into
+// Configuration. The connection name defaults to the sanitized file stem;
+// it can be overridden with a root-level "Name" key.
 func ParseConfig(path string) (*Configuration, error) {
+	specs, err := ParseConfigFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return specs[0].Conf, nil
+}
+
+// ParseConfigFile parses a configuration file into one or more connection
+// specifications, ordered by their appearance in the file. A file without
+// prefixed sections yields exactly one specification.
+func ParseConfigFile(path string) ([]*ConnectionSpec, error) {
+	conf, err := parseSingleConfig(path)
+	if err != nil {
+		return nil, err
+	}
+
+	name := conf.Name
+	if name == "" {
+		name = defaultNameFromFile(path)
+	}
+	conf.Name = name
+
+	return []*ConnectionSpec{{Name: name, Conf: conf}}, nil
+}
+
+func parseSingleConfig(path string) (*Configuration, error) {
 	iniOpt := ini.LoadOptions{
 		Insensitive:            true,
 		AllowShadows:           true,
@@ -640,6 +668,13 @@ func ParseConfig(path string) (*Configuration, error) {
 	}
 
 	root := cfg.Section("")
+	var explicitName string
+	if nameKey, err := root.GetKey("Name"); err == nil {
+		explicitName = sanitizeConnectionName(nameKey.String())
+		if explicitName == "" {
+			return nil, errors.New("Name should not be empty")
+		}
+	}
 	wgConf, err := root.GetKey("WGConfig")
 	wgCfg := cfg
 	if err == nil {
@@ -711,6 +746,7 @@ func ParseConfig(path string) (*Configuration, error) {
 	}
 
 	return &Configuration{
+		Name:     explicitName,
 		Device:   device,
 		Routines: routinesSpawners,
 		Resolve:  resolve,

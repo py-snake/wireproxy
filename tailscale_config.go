@@ -71,3 +71,7 @@ func parseTailscaleConfig(section *ini.Section) (*TailscaleConfig, error) {
 
 	return config, nil
 }
+
+func (c *TailscaleConfig) start(name string, logLevel int) (*VirtualTun, error) {
+	return startTsnet(name, c, logLevel)
+}

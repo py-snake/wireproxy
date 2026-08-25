@@ -69,18 +69,20 @@ func configFilePath() (string, bool) {
 }
 
 // get the file paths for TLS cert and key from the config
-func tlsFilePaths(routines []wireproxy.RoutineSpawner) []string {
+func tlsFilePaths(specs []*wireproxy.ConnectionSpec) []string {
 	var paths []string
-	for _, routine := range routines {
-		http, ok := routine.(*wireproxy.HTTPConfig)
-		if !ok {
-			continue
-		}
-		if http.CertFile != "" {
-			paths = append(paths, http.CertFile)
-		}
-		if http.KeyFile != "" {
-			paths = append(paths, http.KeyFile)
+	for _, spec := range specs {
+		for _, routine := range spec.Conf.Routines {
+			http, ok := routine.(*wireproxy.HTTPConfig)
+			if !ok {
+				continue
+			}
+			if http.CertFile != "" {
+				paths = append(paths, http.CertFile)
+			}
+			if http.KeyFile != "" {
+				paths = append(paths, http.KeyFile)
+			}
 		}
 	}
 	return paths
@@ -163,24 +165,26 @@ func extractPort(addr string) uint16 {
 	return uint16(port)
 }
 
-func lockNetwork(sections []wireproxy.RoutineSpawner, infoAddr *string) {
+func lockNetwork(specs []*wireproxy.ConnectionSpec, infoAddr *string) {
 	var rules []landlock.Rule
 	if infoAddr != nil && *infoAddr != "" {
 		rules = append(rules, landlock.BindTCP(extractPort(*infoAddr)))
 	}
 
-	for _, section := range sections {
-		switch section := section.(type) {
-		case *wireproxy.TCPServerTunnelConfig:
-			rules = append(rules, landlock.ConnectTCP(extractPort(section.Target)))
-		case *wireproxy.HTTPConfig:
-			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
-		case *wireproxy.TCPClientTunnelConfig:
-			rules = append(rules, landlock.BindTCP(uint16(section.BindAddress.Port)))
-		case *wireproxy.Socks5Config:
-			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
-		case *wireproxy.SNIConfig:
-			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+	for _, spec := range specs {
+		for _, section := range spec.Conf.Routines {
+			switch section := section.(type) {
+			case *wireproxy.TCPServerTunnelConfig:
+				rules = append(rules, landlock.ConnectTCP(extractPort(section.Target)))
+			case *wireproxy.HTTPConfig:
+				rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+			case *wireproxy.TCPClientTunnelConfig:
+				rules = append(rules, landlock.BindTCP(uint16(section.BindAddress.Port)))
+			case *wireproxy.Socks5Config:
+				rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+			case *wireproxy.SNIConfig:
+				rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+			}
 		}
 	}
 
@@ -209,12 +213,12 @@ func main() {
 	}
 	parser := argparse.NewParser("wireproxy", "Userspace wireguard client for proxying")
 
-	config := parser.String("c", "config", &argparse.Options{Help: "Path of configuration file"})
+	config := parser.StringList("c", "config", &argparse.Options{Help: "Path of configuration file (repeatable; directories are expanded to their *.conf files)"})
 	silent := parser.Flag("s", "silent", &argparse.Options{Help: "Silent mode"})
 	daemon := parser.Flag("d", "daemon", &argparse.Options{Help: "Make wireproxy run in background"})
 	info := parser.String("i", "info", &argparse.Options{Help: "Specify the address and port for exposing health status"})
 	printVerison := parser.Flag("v", "version", &argparse.Options{Help: "Print version"})
-	configTest := parser.Flag("n", "configtest", &argparse.Options{Help: "Configtest mode. Only check the configuration file for validity."})
+	configTest := parser.Flag("n", "configtest", &argparse.Options{Help: "Configtest mode. Only check the configuration file(s) for validity."})
 
 	err := parser.Parse(args)
 	if err != nil {
@@ -227,9 +231,10 @@ func main() {
 		return
 	}
 
-	if *config == "" {
+	configPaths := *config
+	if len(configPaths) == 0 {
 		if path, config_exist := configFilePath(); config_exist {
-			*config = path
+			configPaths = []string{path}
 		} else {
 			fmt.Println("configuration path is required")
 			return
@@ -240,17 +245,21 @@ func main() {
 		lock("read-config")
 	}
 
-	conf, err := wireproxy.ParseConfig(*config)
+	specs, err := wireproxy.LoadConfigSources(configPaths, *info)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	if *configTest {
-		fmt.Println("Config OK")
+		fmt.Printf("Config OK (%d connection(s):", len(specs))
+		for _, spec := range specs {
+			fmt.Printf(" %s", spec.Name)
+		}
+		fmt.Println(")")
 		return
 	}
 
-	lockNetwork(conf.Routines, info)
+	lockNetwork(specs, info)
 
 	if isDaemonProcess {
 		os.Stdout, _ = os.Open(os.DevNull)
@@ -277,22 +286,33 @@ func main() {
 		logLevel = device.LogLevelSilent
 	}
 
-	lock("ready", tlsFilePaths(conf.Routines)...)
+	lock("ready", tlsFilePaths(specs)...)
 
-	tun, err := wireproxy.StartWireguard(conf, logLevel)
-	if err != nil {
-		log.Fatal(err)
+	registry := wireproxy.NewHealthRegistry()
+	started := 0
+	for _, spec := range specs {
+		tun, err := wireproxy.StartConnection(spec, logLevel)
+		if err != nil {
+			log.Printf("ERROR: connection %q failed to start, skipping: %s\n", spec.Name, err.Error())
+			continue
+		}
+		registry.Add(tun)
+		tun.StartPingIPs()
+
+		log.Printf("connection %q started\n", spec.Name)
+		for _, spawner := range spec.Conf.Routines {
+			go spawner.SpawnRoutine(tun)
+		}
+		started++
 	}
 
-	for _, spawner := range conf.Routines {
-		go spawner.SpawnRoutine(tun)
+	if started == 0 {
+		log.Fatal("no connections could be started")
 	}
-
-	tun.StartPingIPs()
 
 	if *info != "" {
 		go func() {
-			err := http.ListenAndServe(*info, tun)
+			err := http.ListenAndServe(*info, registry)
 			if err != nil {
 				panic(err)
 			}

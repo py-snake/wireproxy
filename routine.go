@@ -6,7 +6,6 @@ import (
 	srand "crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -14,9 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -245,7 +242,7 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 	server := socks5.NewServer(options...)
 
 	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
-		log.Fatal(err)
+		vt.Errorf("socks5 proxy: %s\n", err.Error())
 	}
 }
 
@@ -266,7 +263,7 @@ func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
 	}
 
 	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
-		log.Fatal(err)
+		vt.Errorf("http proxy: %s\n", err.Error())
 	}
 }
 
@@ -332,18 +329,21 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input *os.File, output 
 func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
-		log.Fatal(err)
+		vt.Errorf("TCP client tunnel: %s\n", err.Error())
+		return
 	}
 
 	server, err := net.ListenTCP("tcp", conf.BindAddress)
 	if err != nil {
-		log.Fatal(err)
+		vt.Errorf("TCP client tunnel on %s: %s\n", conf.BindAddress.String(), err.Error())
+		return
 	}
 
 	for {
 		conn, err := server.Accept()
 		if err != nil {
-			log.Fatal(err)
+			vt.Errorf("TCP client tunnel accept: %s\n", err.Error())
+			return
 		}
 		go tcpClientForward(vt, raddr, conn)
 	}
@@ -353,7 +353,8 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
-		log.Fatal(err)
+		vt.Errorf("STDIO tunnel: %s\n", err.Error())
+		return
 	}
 
 	go STDIOTcpForward(vt, raddr, conf.Input, conf.Output)
@@ -384,19 +385,22 @@ func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
-		log.Fatal(err)
+		vt.Errorf("TCP server tunnel: %s\n", err.Error())
+		return
 	}
 
 	addr := &net.TCPAddr{Port: conf.ListenPort}
 	server, err := vt.Net.ListenTCP(addr)
 	if err != nil {
-		log.Fatal(err)
+		vt.Errorf("TCP server tunnel on port %d: %s\n", conf.ListenPort, err.Error())
+		return
 	}
 
 	for {
 		conn, err := server.Accept()
 		if err != nil {
-			log.Fatal(err)
+			vt.Errorf("TCP server tunnel accept: %s\n", err.Error())
+			return
 		}
 		go tcpServerForward(vt, raddr, conn)
 	}
@@ -409,13 +413,15 @@ func (config *SNIConfig) SpawnRoutine(vt *VirtualTun) {
 
 	listener, err := net.Listen("tcp", config.BindAddress)
 	if err != nil {
-		log.Fatal(err)
+		vt.Errorf("SNI proxy on %s: %s\n", config.BindAddress, err.Error())
+		return
 	}
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Fatal(err)
+			vt.Errorf("SNI proxy accept: %s\n", err.Error())
+			return
 		}
 		go sniServe(dial, conn)
 	}
@@ -423,56 +429,10 @@ func (config *SNIConfig) SpawnRoutine(vt *VirtualTun) {
 
 func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Health metric request: %s\n", r.URL.Path)
-	switch path.Clean(r.URL.Path) {
-	case "/readyz":
-		body, err := json.Marshal(d.PingRecord)
-		if err != nil {
-			errorLogger.Printf("Failed to get device metrics: %s\n", err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		status := http.StatusOK
-		for _, record := range d.PingRecord {
-			lastPong := time.Unix(int64(record), 0)
-			// +2 seconds to account for the time it takes to ping the IP
-			if time.Since(lastPong) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
-				status = http.StatusServiceUnavailable
-				break
-			}
-		}
-
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-		_, _ = w.Write([]byte("\n"))
-	case "/metrics":
-		get, err := d.Dev.IpcGet()
-		if err != nil {
-			errorLogger.Printf("Failed to get device metrics: %s\n", err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		var buf bytes.Buffer
-		for _, peer := range strings.Split(get, "\n") {
-			pair := strings.SplitN(peer, "=", 2)
-			if len(pair) != 2 {
-				buf.WriteString(peer)
-				continue
-			}
-			if pair[0] == "private_key" || pair[0] == "preshared_key" {
-				pair[1] = "REDACTED"
-			}
-			buf.WriteString(pair[0])
-			buf.WriteString("=")
-			buf.WriteString(pair[1])
-			buf.WriteString("\n")
-		}
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(buf.Bytes())
-	default:
-		w.WriteHeader(http.StatusNotFound)
-	}
+	registry := NewHealthRegistry()
+	vt := d
+	registry.Add(&vt)
+	registry.ServeHTTP(w, r)
 }
 
 func (d VirtualTun) pingIPs() {
@@ -559,6 +519,10 @@ func (d VirtualTun) pingIPs() {
 }
 
 func (d VirtualTun) StartPingIPs() {
+	if d.Tnet == nil || len(d.Conf.CheckAlive) == 0 {
+		return
+	}
+
 	d.PingRecordLock.Lock()
 	for _, addr := range d.Conf.CheckAlive {
 		d.PingRecord[addr.String()] = 0

@@ -23,14 +23,16 @@ type udpSession struct {
 func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	addr, err := net.ResolveUDPAddr("udp", conf.BindAddress)
 	if err != nil {
-		log.Fatalf("UDPProxyTunnelConfig: could not resolve bind address %s: %v", conf.BindAddress, err)
+		vt.Errorf("UDP proxy tunnel: could not resolve bind address %s: %v", conf.BindAddress, err)
+		return
 	}
 
 	listener, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("UDPProxyTunnelConfig: could not listen on %s: %v", conf.BindAddress, err)
+		vt.Errorf("UDP proxy tunnel: could not listen on %s: %v", conf.BindAddress, err)
+		return
 	}
-	log.Printf("UDPProxyTunnel listening on %s, forwarding to %s", conf.BindAddress, conf.Target)
+	vt.Logf("UDP proxy tunnel listening on %s, forwarding to %s", conf.BindAddress, conf.Target)
 
 	inactivityDur := time.Duration(conf.InactivityTimeout) * time.Second
 	sessions := make(map[string]*udpSession)
