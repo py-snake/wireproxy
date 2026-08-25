@@ -641,7 +641,9 @@ func splitIntoGroups(cfg *ini.File) (*ini.Section, []*connGroup) {
 
 	for _, section := range cfg.Sections() {
 		name := section.Name()
-		if name == ini.DefaultSection || name == "" {
+		// The DEFAULT section holds root keys; under Insensitive its name
+		// is lowercased, so compare case-insensitively.
+		if name == "" || strings.EqualFold(name, ini.DefaultSection) {
 			continue
 		}
 

@@ -109,6 +109,7 @@ func LoadConfigSources(paths []string, infoAddr string) ([]*ConnectionSpec, erro
 //   - Tailscale connections do not carry unsupported routines
 func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 	names := make(map[string]bool)
+	tsHostnames := make(map[string]string)
 
 	type bind struct {
 		kind  string
@@ -143,6 +144,16 @@ func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 		names[spec.Name] = true
 
 		listenPorts := map[int]bool{}
+		if spec.Conf.Tailscale != nil {
+			hostname := strings.ToLower(spec.Conf.Tailscale.Hostname)
+			if prev, ok := tsHostnames[hostname]; ok {
+				return fmt.Errorf("connections %q and %q use the same Tailscale Hostname %q", prev, spec.Name, hostname)
+			}
+			tsHostnames[hostname] = spec.Name
+			if spec.Conf.Device != nil {
+				return fmt.Errorf("connection %q: [Interface] and [Tailscale] are mutually exclusive", spec.Name)
+			}
+		}
 		for _, r := range spec.Conf.Routines {
 			switch rt := r.(type) {
 			case *TCPClientTunnelConfig:

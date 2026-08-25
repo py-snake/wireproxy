@@ -10,6 +10,10 @@ all: wireproxy
 wireproxy:
 	${GO} build -trimpath -ldflags "-s -w -X 'main.version=${TAG}'" ./cmd/wireproxy
 
+.PHONY: wireproxy-tsnet
+wireproxy-tsnet:
+	${GO} build -tags tsnet -trimpath -ldflags "-s -w -X 'main.version=${TAG}-tsnet'" ./cmd/wireproxy
+
 .PHONY: clean
 clean:
 	${RM} wireproxy
