@@ -140,12 +140,52 @@ jobs:
           go-version: "1.26"
       - name: Building Darwin arm64 Version
         run: |
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o WireProxy_arm64 -v ./cmd/wireproxy
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o WireProxy_amd64 -v ./cmd/wireproxy
           mkdir release_darwin_arm64
-          mv WireProxy_arm64 wireproxy
+          mv WireProxy_amd64 wireproxy
           cp wireproxy release_darwin_arm64/wireproxy
       - name: Upload Darwin arm64 Version
         uses: actions/upload-artifact@v4
         with:
           name: WireProxy_darwin_arm64
           path: release_darwin_arm64
+  linuxAmd64TsnetBuild:
+    name: Build Linux amd64 Version (Tailscale)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setting up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Building Linux amd64 Version with Tailscale support
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags tsnet -o WireProxy_amd64 -v ./cmd/wireproxy
+          mkdir release_linux_amd64_tsnet
+          mv WireProxy_amd64 wireproxy
+          cp wireproxy release_linux_amd64_tsnet/wireproxy
+      - name: Upload Linux amd64 Version (Tailscale)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WireProxy_linux_amd64_tsnet
+          path: release_linux_amd64_tsnet
+  linuxArm64TsnetBuild:
+    name: Build Linux arm64 Version (Tailscale)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setting up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Building Linux arm64 Version with Tailscale support
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags tsnet -o WireProxy_arm64 -v ./cmd/wireproxy
+          mkdir release_linux_arm64_tsnet
+          mv WireProxy_arm64 wireproxy
+          cp wireproxy release_linux_arm64_tsnet/wireproxy
+      - name: Upload Linux arm64 Version (Tailscale)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WireProxy_linux_arm64_tsnet
+          path: release_linux_arm64_tsnet

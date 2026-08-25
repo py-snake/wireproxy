@@ -918,7 +918,18 @@ func ParseConfig(path string) (*Configuration, error) {
 // unprefixed sections form the implicit default connection, so classic
 // single-connection files keep working unchanged.
 func ParseConfigFile(path string) ([]*ConnectionSpec, error) {
-	cfg, err := ini.LoadSources(wgIniOptions, path)
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseConfigSource(source, path)
+}
+
+// parseConfigSource parses a wireproxy configuration given as bytes.
+// sourcePath is used to resolve relative WGConfig imports and to derive
+// the default connection name.
+func parseConfigSource(source []byte, sourcePath string) ([]*ConnectionSpec, error) {
+	cfg, err := ini.LoadSources(wgIniOptions, source)
 	if err != nil {
 		return nil, err
 	}
@@ -935,7 +946,7 @@ func ParseConfigFile(path string) ([]*ConnectionSpec, error) {
 
 	specs := make([]*ConnectionSpec, 0, len(groups))
 	for _, g := range groups {
-		conf, err := g.parse(path, root)
+		conf, err := g.parse(sourcePath, root)
 		if err != nil {
 			return nil, err
 		}
@@ -945,7 +956,7 @@ func ParseConfigFile(path string) ([]*ConnectionSpec, error) {
 			if explicitName != "" {
 				name = explicitName
 			} else {
-				name = defaultNameFromFile(path)
+				name = defaultNameFromFile(sourcePath)
 			}
 		}
 		conf.Name = name

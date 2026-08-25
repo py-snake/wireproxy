@@ -37,6 +37,8 @@ of wireproxy by [@artem-russkikh](https://github.com/artem-russkikh).
 - TCP static routing for client and server
 - SOCKS5/HTTP proxy (currently only CONNECT is supported)
 - Transparent TLS ([SNI](https://en.wikipedia.org/wiki/Server_Name_Indication)) proxy
+- Multiple connections in one process (WireGuard and/or Tailscale), each with its own proxies
+- Tailscale support via embedded [tsnet](https://pkg.go.dev/tailscale.com/tsnet) (`-tags tsnet` build)
 
 # TODO
 
@@ -75,6 +77,12 @@ Arguments:
 git clone https://github.com/octeep/wireproxy
 cd wireproxy
 make
+```
+
+To also enable Tailscale connections:
+
+```bash
+make wireproxy-tsnet   # builds with -tags tsnet (~3x binary size)
 ```
 
 # Install
@@ -261,6 +269,98 @@ AllowedIPs = 10.254.254.100/32
 # Note there is no Endpoint defined here.
 ```
 
+# Multiple connections
+
+wireproxy can run several independent connections (different VPN servers, or a
+mix of WireGuard and Tailscale) inside one process. Each connection gets its
+own proxies/tunnels on distinct local ports.
+
+There are two ways to define multiple connections:
+
+## 1. Repeated `-c` flags or a directory
+
+```bash
+./wireproxy -c vpn1.conf -c vpn2.conf -c vpn3.conf -i 127.0.0.1:9080
+# or point at a directory of *.conf files:
+./wireproxy -c /etc/wireproxy/connections/
+```
+
+Each file keeps the classic format shown above. A connection is named after
+its file stem (`vpn1.conf` → `vpn1`), overridable with a root-level `Name =`
+key.
+
+## 2. Named groups inside one file
+
+Sections prefixed with `<name>.` form their own connection; unprefixed
+sections form the default connection:
+
+```ini
+[Interface]
+Address = 10.200.200.2/32
+PrivateKey = ...
+[Peer]
+Endpoint = vpn1.example.com:51820
+...
+[Socks5]
+BindAddress = 127.0.0.1:1081
+
+[de.Interface]
+Address = 10.201.201.2/32
+PrivateKey = ...
+[de.Peer]
+Endpoint = vpn2.example.com:51820
+...
+[de.Socks5]
+BindAddress = 127.0.0.1:1082
+```
+
+Notes:
+
+- Group names are case-insensitive (lowercased).
+- Each group may import a plain WireGuard config via a `WGConfig` key inside
+  its `[<name>.Interface]` section.
+- `[Resolve]` is global by default; `[<name>.Resolve]` overrides it per
+  connection.
+- See [examples/multi-vpn.conf](examples/multi-vpn.conf).
+
+## Failure handling
+
+Startup validation is strict: duplicate connection names, conflicting bind
+ports across connections, or invalid sections abort before anything starts
+(`--configtest` checks all of this without starting). At runtime, failures are
+best-effort: if one connection cannot start (bad key, port taken), wireproxy
+logs an error and keeps serving the remaining connections.
+
+# Tailscale support
+
+Binaries built with `-tags tsnet` accept `[Tailscale]` sections, which embed a
+Tailscale node in the process using [tsnet](https://tailscale.com/kb/1244/tsnet):
+
+```ini
+[Tailscale]                      # or [mytail.Tailscale] as a named group
+Hostname = wireproxy-node        # node name registered in your tailnet
+AuthKey = $TS_AUTHKEY            # optional; omit for interactive login URL
+ControlURL =                     ; empty = Tailscale cloud; set for Headscale
+Ephemeral = false
+StateDir = $HOME/.local/share/wireproxy/tsnet-wireproxy-node
+AdvertiseTags = tag:proxy        ; optional ACL tags
+
+[Socks5]
+BindAddress = 127.0.0.1:1084     # dials INTO the tailnet
+```
+
+All proxy/tunnel types work against a Tailscale connection with the same
+semantics as WireGuard:
+
+- `Socks5`, `HTTP`, `SNI`, `TCPClientTunnel`, `STDIOTunnel`: dial tailnet
+  addresses/MagicDNS names (use `TunnelDomains` to pin a proxy to specific
+  peers, e.g. `TunnelDomains = ^nas\.tail1234\.ts\.net$`).
+- `TCPServerTunnel`: listens **on the tailnet** so other peers can reach a
+  local service.
+- Not supported: `UDPProxyTunnel`, `CheckAlive` (ICMP), `/metrics`.
+
+See [examples/tailscale.conf](examples/tailscale.conf).
+
 # Health endpoint
 
 Wireproxy supports exposing a health endpoint for monitoring purposes.
@@ -268,9 +368,9 @@ The argument `--info/-i` specifies an address and port (e.g. `localhost:9080`), 
 
 Currently two endpoints are implemented:
 
-`/metrics`: Exposes information of the wireguard daemon, this provides the same information you would get with `wg show`. [This](https://www.wireguard.com/xplatform/#example-dialog) shows an example of what the response would look like.
+`/metrics`: Exposes information of the wireguard daemon, this provides the same information you would get with `wg show`. [This](https://www.wireguard.com/xplatform/#example-dialog) shows an example of what the response would look like. With multiple connections the output contains one `# connection: <name>` block per connection.
 
-`/readyz`: This responds with a json which shows the last time a pong is received from an IP specified with `CheckAlive`. When `CheckAlive` is set, a ping is sent out to addresses in `CheckAlive` per `CheckAliveInterval` seconds (defaults to 5) via wireguard. If a pong has not been received from one of the addresses within the last `CheckAliveInterval` seconds (+2 seconds for some leeway to account for latency), then it would respond with a 503, otherwise a 200.
+`/readyz`: This responds with a json which shows the last time a pong is received from an IP specified with `CheckAlive`, keyed by connection name. When `CheckAlive` is set, a ping is sent out to addresses in `CheckAlive` per `CheckAliveInterval` seconds (defaults to 5) via wireguard. If a pong has not been received from one of the addresses within the last `CheckAliveInterval` seconds (+2 seconds for some leeway to account for latency), then it would respond with a 503, otherwise a 200. Connections without `CheckAlive` contribute an empty object and never affect the status code.
 
 For example:
 
