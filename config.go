@@ -598,24 +598,305 @@ func parseUDPProxyTunnelConfig(section *ini.Section) (RoutineSpawner, error) {
 	return config, nil
 }
 
-// Takes a function that parses an individual section into a config, and apply it on all
-// specified sections
-func parseRoutinesConfig(routines *[]RoutineSpawner, cfg *ini.File, sectionName string, f func(*ini.Section) (RoutineSpawner, error)) error {
-	sections, err := cfg.SectionsByName(sectionName)
+// routineParsers maps a section type onto its parser. The order determines
+// the spawn order of routines inside one connection.
+var routineParsers = []struct {
+	sectionType string
+	parse       func(*ini.Section) (RoutineSpawner, error)
+}{
+	{"tcpclienttunnel", parseTCPClientTunnelConfig},
+	{"stdiotunnel", parseSTDIOTunnelConfig},
+	{"tcpservertunnel", parseTCPServerTunnelConfig},
+	{"socks5", parseSocks5Config},
+	{"http", parseHTTPConfig},
+	{"sni", parseSNIConfig},
+	{"udpproxytunnel", parseUDPProxyTunnelConfig},
+}
+
+// connGroup collects the sections belonging to one connection while
+// preserving their file order. The unnamed group is the implicit default
+// connection used by classic single-connection configurations.
+type connGroup struct {
+	name string
+
+	iface     []*ini.Section
+	peers     []*ini.Section
+	tailscale []*ini.Section
+	resolve   []*ini.Section
+	routines  map[string][]*ini.Section
+}
+
+func newConnGroup(name string) *connGroup {
+	return &connGroup{name: name, routines: make(map[string][]*ini.Section)}
+}
+
+// splitIntoGroups partitions all named sections into connections. Sections
+// named "<group>.<Type>" belong to connection <group>; everything else
+// belongs to the default connection. The returned ini.Section is the
+// DEFAULT section holding root keys (e.g. WGConfig, Name).
+func splitIntoGroups(cfg *ini.File) (*ini.Section, []*connGroup) {
+	root := cfg.Section(ini.DefaultSection)
+	groups := make([]*connGroup, 0, 1)
+	byName := make(map[string]*connGroup)
+
+	for _, section := range cfg.Sections() {
+		name := section.Name()
+		if name == ini.DefaultSection || name == "" {
+			continue
+		}
+
+		groupName := ""
+		sectionType := name
+		if idx := strings.IndexByte(name, '.'); idx >= 0 {
+			groupName, sectionType = name[:idx], name[idx+1:]
+		}
+
+		g, ok := byName[groupName]
+		if !ok {
+			g = newConnGroup(groupName)
+			byName[groupName] = g
+			groups = append(groups, g)
+		}
+
+		switch sectionType {
+		case "interface":
+			g.iface = append(g.iface, section)
+		case "peer":
+			g.peers = append(g.peers, section)
+		case "tailscale":
+			g.tailscale = append(g.tailscale, section)
+		case "resolve":
+			g.resolve = append(g.resolve, section)
+		default:
+			g.routines[sectionType] = append(g.routines[sectionType], section)
+		}
+	}
+	return root, groups
+}
+
+// parseInterfaceSection fills device from a single [Interface] section.
+func parseInterfaceSection(section *ini.Section, device *DeviceConfig) error {
+	address, err := parseCIDRNetIP(section, "Address")
 	if err != nil {
-		return nil
+		return err
+	}
+	device.Endpoint = address
+
+	privKey, err := parseBase64KeyToHex(section, "PrivateKey")
+	if err != nil {
+		return err
+	}
+	device.SecretKey = privKey
+
+	dns, err := parseNetIP(section, "DNS")
+	if err != nil {
+		return err
+	}
+	device.DNS = dns
+
+	if sectionKey, err := section.GetKey("MTU"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		device.MTU = value
 	}
 
+	if sectionKey, err := section.GetKey("ListenPort"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		device.ListenPort = &value
+	}
+
+	checkAlive, err := parseNetIP(section, "CheckAlive")
+	if err != nil {
+		return err
+	}
+	device.CheckAlive = checkAlive
+
+	device.CheckAliveInterval = 5
+	if sectionKey, err := section.GetKey("CheckAliveInterval"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		if len(checkAlive) == 0 {
+			return errors.New("CheckAliveInterval is only valid when CheckAlive is set")
+		}
+
+		device.CheckAliveInterval = value
+	}
+
+	return nil
+}
+
+// parsePeerSections fills peers from [Peer] sections.
+func parsePeerSections(sections []*ini.Section, peers *[]PeerConfig) error {
 	for _, section := range sections {
-		config, err := f(section)
+		peer := PeerConfig{
+			PreSharedKey: "0000000000000000000000000000000000000000000000000000000000000000",
+			KeepAlive:    0,
+		}
+
+		decoded, err := parseBase64KeyToHex(section, "PublicKey")
+		if err != nil {
+			return err
+		}
+		peer.PublicKey = decoded
+
+		if sectionKey, err := section.GetKey("PreSharedKey"); err == nil {
+			value, err := encodeBase64ToHex(sectionKey.String())
+			if err != nil {
+				return err
+			}
+			peer.PreSharedKey = value
+		}
+
+		if sectionKey, err := section.GetKey("Endpoint"); err == nil {
+			value := sectionKey.String()
+			decoded, err = resolveIPPAndPort(strings.ToLower(value))
+			if err != nil {
+				return err
+			}
+			peer.Endpoint = &decoded
+		}
+
+		if sectionKey, err := section.GetKey("PersistentKeepalive"); err == nil {
+			value, err := sectionKey.Int()
+			if err != nil {
+				return err
+			}
+			peer.KeepAlive = value
+		}
+
+		peer.AllowedIPs, err = parseAllowedIPs(section)
 		if err != nil {
 			return err
 		}
 
-		*routines = append(*routines, config)
+		*peers = append(*peers, peer)
+	}
+	return nil
+}
+
+// wgIniOptions are the options used for loading wireproxy and plain
+// WireGuard configuration files alike.
+var wgIniOptions = ini.LoadOptions{
+	Insensitive:            true,
+	AllowShadows:           true,
+	AllowNonUniqueSections: true,
+}
+
+// resolveWGConfigPath resolves a WGConfig value relative to the directory of
+// the referencing wireproxy configuration when it is a bare filename.
+func resolveWGConfigPath(wgPath, parentDir string) string {
+	if filepath.Base(wgPath) == wgPath {
+		wgPath = filepath.Join(parentDir, wgPath)
+	}
+	return wgPath
+}
+
+// parse turns one group of sections into a Configuration. sourcePath is the
+// path of the wireproxy config file (used to resolve relative WGConfig
+// paths); root holds the file's root keys (e.g. WGConfig for the default
+// connection).
+func (g *connGroup) parse(sourcePath string, root *ini.Section) (*Configuration, error) {
+	resolve := &ResolveConfig{ResolveStrategy: "auto"}
+	if len(g.resolve) > 0 {
+		r, err := parseResolveConfig(g.resolve[0])
+		if err != nil {
+			return nil, err
+		}
+		resolve = r
 	}
 
-	return nil
+	conf := &Configuration{Name: g.name, Resolve: resolve}
+
+	// A [Tailscale] section makes this a Tailscale connection; WireGuard
+	// sections must not be mixed in.
+	if len(g.tailscale) > 0 {
+		if len(g.iface) > 0 || len(g.peers) > 0 {
+			return nil, errors.New("[Tailscale] cannot be combined with [Interface] or [Peer] sections in the same connection")
+		}
+		if len(g.tailscale) > 1 {
+			return nil, errors.New("at most one [Tailscale] section is expected per connection")
+		}
+		tsConf, err := parseTailscaleConfig(g.tailscale[0])
+		if err != nil {
+			return nil, err
+		}
+		conf.Tailscale = tsConf
+		return g.appendRoutines(conf)
+	}
+
+	device := &DeviceConfig{MTU: 1420}
+	parentDir := filepath.Dir(sourcePath)
+
+	// Determine where the WireGuard device configuration comes from:
+	//   - an external file referenced by a WGConfig key inside this
+	//     group's [Interface] section (any connection), or by the root
+	//     WGConfig key (default connection only)
+	//   - or inline [Interface]/[Peer] sections
+	externalPath := ""
+	switch len(g.iface) {
+	case 0:
+		if g.name != "" {
+			return nil, errors.New("one and only one [Interface] is expected")
+		}
+		if key, err := root.GetKey("WGConfig"); err == nil {
+			externalPath = resolveWGConfigPath(key.String(), parentDir)
+		} else {
+			return nil, errors.New("one and only one [Interface] is expected")
+		}
+	case 1:
+		if key, err := g.iface[0].GetKey("WGConfig"); err == nil {
+			externalPath = resolveWGConfigPath(key.String(), parentDir)
+		}
+	default:
+		return nil, errors.New("one and only one [Interface] is expected")
+	}
+
+	if externalPath != "" {
+		wgCfg, err := ini.LoadSources(wgIniOptions, externalPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := ParseInterface(wgCfg, device); err != nil {
+			return nil, err
+		}
+		if err := ParsePeers(wgCfg, &device.Peers); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := parseInterfaceSection(g.iface[0], device); err != nil {
+			return nil, err
+		}
+		if len(g.peers) == 0 {
+			return nil, errors.New("at least one [Peer] is expected")
+		}
+		if err := parsePeerSections(g.peers, &device.Peers); err != nil {
+			return nil, err
+		}
+	}
+	conf.Device = device
+
+	return g.appendRoutines(conf)
+}
+
+// appendRoutines parses all routine sections of the group in canonical order.
+func (g *connGroup) appendRoutines(conf *Configuration) (*Configuration, error) {
+	for _, rp := range routineParsers {
+		for _, section := range g.routines[rp.sectionType] {
+			routine, err := rp.parse(section)
+			if err != nil {
+				return nil, err
+			}
+			conf.Routines = append(conf.Routines, routine)
+		}
+	}
+	return conf, nil
 }
 
 // ParseConfig takes the path of a configuration file and parses it into
@@ -630,125 +911,47 @@ func ParseConfig(path string) (*Configuration, error) {
 }
 
 // ParseConfigFile parses a configuration file into one or more connection
-// specifications, ordered by their appearance in the file. A file without
-// prefixed sections yields exactly one specification.
+// specifications, ordered by their appearance in the file. Sections named
+// "<group>.<Type>" (e.g. [vpn2.Socks5]) form their own connections;
+// unprefixed sections form the implicit default connection, so classic
+// single-connection files keep working unchanged.
 func ParseConfigFile(path string) ([]*ConnectionSpec, error) {
-	conf, err := parseSingleConfig(path)
+	cfg, err := ini.LoadSources(wgIniOptions, path)
 	if err != nil {
 		return nil, err
 	}
 
-	name := conf.Name
-	if name == "" {
-		name = defaultNameFromFile(path)
-	}
-	conf.Name = name
+	root, groups := splitIntoGroups(cfg)
 
-	return []*ConnectionSpec{{Name: name, Conf: conf}}, nil
-}
-
-func parseSingleConfig(path string) (*Configuration, error) {
-	iniOpt := ini.LoadOptions{
-		Insensitive:            true,
-		AllowShadows:           true,
-		AllowNonUniqueSections: true,
-	}
-
-	cfg, err := ini.LoadSources(iniOpt, path)
-	if err != nil {
-		return nil, err
-	}
-
-	device := &DeviceConfig{
-		MTU: 1420,
-	}
-
-	resolve := &ResolveConfig{
-		ResolveStrategy: "auto",
-	}
-
-	root := cfg.Section("")
-	var explicitName string
-	if nameKey, err := root.GetKey("Name"); err == nil {
-		explicitName = sanitizeConnectionName(nameKey.String())
+	explicitName := ""
+	if key, err := root.GetKey("Name"); err == nil {
+		explicitName = sanitizeConnectionName(key.String())
 		if explicitName == "" {
 			return nil, errors.New("Name should not be empty")
 		}
 	}
-	wgConf, err := root.GetKey("WGConfig")
-	wgCfg := cfg
-	if err == nil {
-		wgPath := wgConf.String()
-		// A bare filename (no path separators) is resolved relative to the
-		// directory of the parent config file, so the wg config can sit
-		// alongside the wireproxy config without needing a full path.
-		if filepath.Base(wgPath) == wgPath {
-			wgPath = filepath.Join(filepath.Dir(path), wgPath)
-		}
-		wgCfg, err = ini.LoadSources(iniOpt, wgPath)
+
+	specs := make([]*ConnectionSpec, 0, len(groups))
+	for _, g := range groups {
+		conf, err := g.parse(path, root)
 		if err != nil {
 			return nil, err
 		}
-	}
 
-	err = ParseInterface(wgCfg, device)
-	if err != nil {
-		return nil, err
-	}
-
-	err = ParsePeers(wgCfg, &device.Peers)
-	if err != nil {
-		return nil, err
-	}
-
-	var routinesSpawners []RoutineSpawner
-
-	err = parseRoutinesConfig(&routinesSpawners, cfg, "TCPClientTunnel", parseTCPClientTunnelConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	err = parseRoutinesConfig(&routinesSpawners, cfg, "STDIOTunnel", parseSTDIOTunnelConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	err = parseRoutinesConfig(&routinesSpawners, cfg, "TCPServerTunnel", parseTCPServerTunnelConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	err = parseRoutinesConfig(&routinesSpawners, cfg, "Socks5", parseSocks5Config)
-	if err != nil {
-		return nil, err
-	}
-
-	err = parseRoutinesConfig(&routinesSpawners, cfg, "http", parseHTTPConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	err = parseRoutinesConfig(&routinesSpawners, cfg, "SNI", parseSNIConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	if resolveSection, err := cfg.GetSection("Resolve"); err == nil {
-		resolve, err = parseResolveConfig(resolveSection)
-		if err != nil {
-			return nil, err
+		name := g.name
+		if name == "" {
+			if explicitName != "" {
+				name = explicitName
+			} else {
+				name = defaultNameFromFile(path)
+			}
 		}
+		conf.Name = name
+		specs = append(specs, &ConnectionSpec{Name: name, Conf: conf})
 	}
 
-	err = parseRoutinesConfig(&routinesSpawners, cfg, "UDPProxyTunnel", parseUDPProxyTunnelConfig)
-	if err != nil {
-		return nil, err
+	if len(specs) == 0 {
+		return nil, errors.New("no connections defined")
 	}
-
-	return &Configuration{
-		Name:     explicitName,
-		Device:   device,
-		Routines: routinesSpawners,
-		Resolve:  resolve,
-	}, nil
+	return specs, nil
 }
