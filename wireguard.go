@@ -100,6 +100,15 @@ func StartWireguard(conf *Configuration, logLevel int) (*VirtualTun, error) {
 		return nil, err
 	}
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, ""))
+	// Ensure the device's goroutines and UDP bind are released whenever we
+	// do not hand it over to a VirtualTun.
+	success := false
+	defer func() {
+		if !success {
+			dev.Close()
+		}
+	}()
+
 	err = dev.IpcSet(setting.IpcRequest)
 	if err != nil {
 		return nil, err
@@ -109,6 +118,11 @@ func StartWireguard(conf *Configuration, logLevel int) (*VirtualTun, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Resolve the strategy locally: "auto" depends on this device's
+	// addresses and mutating the shared configuration would race with
+	// other connections started concurrently.
+	resolve := *conf.Resolve
 
 	hasV4 := false
 	hasV6 := false
@@ -121,22 +135,24 @@ func StartWireguard(conf *Configuration, logLevel int) (*VirtualTun, error) {
 		}
 	}
 
-	if conf.Resolve.ResolveStrategy == "auto" {
+	if resolve.ResolveStrategy == "auto" {
 		if hasV4 && !hasV6 {
-			conf.Resolve.ResolveStrategy = "ipv4"
+			resolve.ResolveStrategy = "ipv4"
 		} else {
-			conf.Resolve.ResolveStrategy = "ipv6"
+			resolve.ResolveStrategy = "ipv6"
 		}
 	}
-	return &VirtualTun{
+	vt := &VirtualTun{
 		Name:           conf.Name,
 		Tnet:           tnet,
 		Net:            &netstackNetwork{tnet: tnet},
 		Dev:            dev,
 		Conf:           deviceConf,
-		ResolveConfig:  conf.Resolve,
 		SystemDNS:      len(setting.DNS) == 0,
 		PingRecord:     make(map[string]uint64),
 		PingRecordLock: new(sync.Mutex),
-	}, nil
+	}
+	vt.ResolveConfig = &resolve
+	success = true
+	return vt, nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
@@ -88,7 +91,18 @@ func tlsFilePaths(specs []*wireproxy.ConnectionSpec) []string {
 	return paths
 }
 
-func lock(stage string, roFilles ...string) {
+// lockOptions carries the per-run sandbox requirements derived from the
+// parsed configuration.
+type lockOptions struct {
+	// roFiles are extra read-only file paths (TLS cert/key material).
+	roFiles []string
+	// rwDirs are directories that must stay writable (Tailscale state).
+	rwDirs []string
+	// needsWriteAccess relaxes the OpenBSD pledge to allow writes.
+	needsWriteAccess bool
+}
+
+func lock(stage string, opts lockOptions) {
 	switch stage {
 	case "boot":
 		exePath := executablePath()
@@ -97,12 +111,13 @@ func lock(stage string, roFilles ...string) {
 		unveilOrPanic(exePath, "x")
 		// only allow standard stdio operation, file reading, networking, and exec
 		// also remove unveil permission to lock unveil
-		pledgeOrPanic("stdio rpath inet dns proc exec")
-		// Linux
-		panicIfError(landlock.V1.BestEffort().RestrictPaths(
-			landlock.RODirs("/"),
-			landlock.RWFiles("/dev/null").IgnoreIfMissing(),
-		))
+		// NOTE: wpath/cpath are kept until the "ready" stage because Tailscale
+		// connections may need them; they are dropped there.
+		pledgeOrPanic("stdio rpath inet dns proc exec wpath cpath")
+		// Linux: filesystem lockdown is deferred entirely to the "ready"
+		// stage, where all dynamic requirements (TLS material, Tailscale
+		// state dirs) are known. Applying RODirs("/") here would make it
+		// impossible to grant write access later: Landlock layers intersect.
 	case "boot-daemon":
 	case "read-config":
 		// OpenBSD
@@ -110,7 +125,11 @@ func lock(stage string, roFilles ...string) {
 	case "ready":
 		// no file access is allowed from now on, only networking
 		// OpenBSD
-		pledgeOrPanic("stdio inet dns")
+		pledge := "stdio inet dns"
+		if opts.needsWriteAccess {
+			pledge = "stdio inet dns wpath cpath"
+		}
+		pledgeOrPanic(pledge)
 		// Linux
 		net.DefaultResolver.PreferGo = true // needed to lock down dependencies
 
@@ -138,10 +157,11 @@ func lock(stage string, roFilles ...string) {
 			landlock.RWFiles("/proc/self/fd").IgnoreIfMissing(),
 		}
 
-		if len(roFilles) > 0 {
-			for _, file := range roFilles {
-				rules = append(rules, landlock.ROFiles(file).IgnoreIfMissing())
-			}
+		for _, file := range opts.roFiles {
+			rules = append(rules, landlock.ROFiles(file).IgnoreIfMissing())
+		}
+		for _, dir := range opts.rwDirs {
+			rules = append(rules, landlock.RWDirs(dir))
 		}
 
 		panicIfError(landlock.V1.BestEffort().RestrictPaths(rules...))
@@ -151,49 +171,90 @@ func lock(stage string, roFilles ...string) {
 	}
 }
 
-func extractPort(addr string) uint16 {
+// extractPort parses the port of addr, rejecting out-of-range values that
+// would silently truncate to a different port when narrowed to uint16.
+func extractPort(addr string) (uint16, error) {
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		panic(fmt.Errorf("failed to extract port from %s: %w", addr, err))
+		return 0, fmt.Errorf("failed to extract port from %s: %w", addr, err)
 	}
 
 	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		panic(fmt.Errorf("failed to extract port from %s: %w", addr, err))
+	if err != nil || port < 0 || port > 65535 {
+		return 0, fmt.Errorf("failed to extract port from %s: invalid port", addr)
 	}
 
-	return uint16(port)
+	return uint16(port), nil
 }
 
-func lockNetwork(specs []*wireproxy.ConnectionSpec, infoAddr *string) {
+func lockNetwork(specs []*wireproxy.ConnectionSpec, infoAddr *string) error {
+	// Tailscale connections dial arbitrary control/DERP endpoints and
+	// split-routed proxies dial non-matching destinations directly; the
+	// TCP connect restriction cannot express these policies.
+	if wireproxy.NeedsOpenEgress(specs) {
+		log.Println("WARNING: skipping Landlock network restrictions: " +
+			"the configuration contains a Tailscale connection or split-routed proxy that requires arbitrary outbound connectivity")
+		return nil
+	}
+
 	var rules []landlock.Rule
 	if infoAddr != nil && *infoAddr != "" {
-		rules = append(rules, landlock.BindTCP(extractPort(*infoAddr)))
+		port, err := extractPort(*infoAddr)
+		if err != nil {
+			return err
+		}
+		rules = append(rules, landlock.BindTCP(port))
 	}
 
 	for _, spec := range specs {
 		for _, section := range spec.Conf.Routines {
 			switch section := section.(type) {
 			case *wireproxy.TCPServerTunnelConfig:
-				rules = append(rules, landlock.ConnectTCP(extractPort(section.Target)))
+				host, portStr, err := net.SplitHostPort(section.Target)
+				if err != nil {
+					return fmt.Errorf("connection %q: TCPServerTunnel target %q: %w", spec.Name, section.Target, err)
+				}
+				port, err := extractPort(net.JoinHostPort(host, portStr))
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
+				rules = append(rules, landlock.ConnectTCP(port))
 			case *wireproxy.HTTPConfig:
-				rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+				port, err := extractPort(section.BindAddress)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
+				rules = append(rules, landlock.BindTCP(port))
 			case *wireproxy.TCPClientTunnelConfig:
+				if section.BindAddress == nil {
+					return fmt.Errorf("connection %q: TCPClientTunnel has no bind address", spec.Name)
+				}
 				rules = append(rules, landlock.BindTCP(uint16(section.BindAddress.Port)))
 			case *wireproxy.Socks5Config:
-				rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+				port, err := extractPort(section.BindAddress)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
+				rules = append(rules, landlock.BindTCP(port))
 			case *wireproxy.SNIConfig:
-				rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+				port, err := extractPort(section.BindAddress)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
+				rules = append(rules, landlock.BindTCP(port))
+			case *wireproxy.UDPProxyTunnelConfig:
+				// UDP is outside Landlock V4's TCP-only net rules.
 			}
 		}
 	}
 
 	panicIfError(landlock.V4.BestEffort().RestrictNet(rules...))
+	return nil
 }
 
 func main() {
 	s := make(chan os.Signal, 1)
-	signal.Notify(s, syscall.SIGINT, syscall.SIGQUIT)
+	signal.Notify(s, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
@@ -202,14 +263,14 @@ func main() {
 	}()
 
 	exePath := executablePath()
-	lock("boot")
+	lock("boot", lockOptions{})
 
 	isDaemonProcess := len(os.Args) > 1 && os.Args[1] == daemonProcess
-	args := os.Args
+	// Copy argv before mutating it: args aliases os.Args' backing array.
+	args := append([]string(nil), os.Args...)
 	if isDaemonProcess {
-		lock("boot-daemon")
-		args = []string{args[0]}
-		args = append(args, os.Args[2:]...)
+		lock("boot-daemon", lockOptions{})
+		args = append([]string{args[0]}, os.Args[2:]...)
 	}
 	parser := argparse.NewParser("wireproxy", "Userspace wireguard client for proxying")
 
@@ -242,7 +303,7 @@ func main() {
 	}
 
 	if !*daemon {
-		lock("read-config")
+		lock("read-config", lockOptions{})
 	}
 
 	specs, err := wireproxy.LoadConfigSources(configPaths, *info)
@@ -259,7 +320,9 @@ func main() {
 		return
 	}
 
-	lockNetwork(specs, info)
+	if err := lockNetwork(specs, info); err != nil {
+		log.Fatal(err)
+	}
 
 	if isDaemonProcess {
 		os.Stdout, _ = os.Open(os.DevNull)
@@ -286,35 +349,56 @@ func main() {
 		logLevel = device.LogLevelSilent
 	}
 
-	lock("ready", tlsFilePaths(specs)...)
+	readyOpts := lockOptions{
+		roFiles:          tlsFilePaths(specs),
+		rwDirs:           wireproxy.TailscaleStateDirs(specs),
+		needsWriteAccess: len(wireproxy.TailscaleStateDirs(specs)) > 0,
+	}
+	lock("ready", readyOpts)
 
-	registry := wireproxy.NewHealthRegistry()
-	started := 0
-	for _, spec := range specs {
-		tun, err := wireproxy.StartConnection(spec, logLevel)
+	// Bind the health endpoint (if requested) BEFORE starting connections:
+	// a failed bind then aborts deterministically instead of killing a
+	// running daemon from inside a goroutine later on.
+	var healthListener net.Listener
+	if *info != "" {
+		healthListener, err = net.Listen("tcp", *info)
 		if err != nil {
-			log.Printf("ERROR: connection %q failed to start, skipping: %s\n", spec.Name, err.Error())
-			continue
+			log.Fatalf("cannot bind health endpoint on %s: %s\n", *info, err.Error())
 		}
-		registry.Add(tun)
-		tun.StartPingIPs()
-
-		log.Printf("connection %q started\n", spec.Name)
-		for _, spawner := range spec.Conf.Routines {
-			go spawner.SpawnRoutine(tun)
-		}
-		started++
 	}
 
-	if started == 0 {
+	registry := wireproxy.NewHealthRegistry()
+	var wg sync.WaitGroup
+	started := int32(0)
+	for _, spec := range specs {
+		wg.Add(1)
+		go func(spec *wireproxy.ConnectionSpec) {
+			defer wg.Done()
+			tun, err := wireproxy.StartConnection(spec, logLevel)
+			if err != nil {
+				log.Printf("ERROR: connection %q failed to start, skipping: %s\n", spec.Name, err.Error())
+				return
+			}
+			registry.Add(tun)
+			tun.StartPingIPs()
+
+			log.Printf("connection %q started\n", spec.Name)
+			for _, spawner := range spec.Conf.Routines {
+				go spawner.SpawnRoutine(tun)
+			}
+			atomic.AddInt32(&started, 1)
+		}(spec)
+	}
+	wg.Wait()
+
+	if atomic.LoadInt32(&started) == 0 {
 		log.Fatal("no connections could be started")
 	}
 
-	if *info != "" {
+	if healthListener != nil {
 		go func() {
-			err := http.ListenAndServe(*info, registry)
-			if err != nil {
-				panic(err)
+			if err := http.Serve(healthListener, registry); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("health endpoint stopped: %s\n", err.Error())
 			}
 		}()
 	}

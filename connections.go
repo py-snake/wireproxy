@@ -2,10 +2,12 @@ package wireproxy
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -33,7 +35,8 @@ func StartConnection(spec *ConnectionSpec, logLevel int) (*VirtualTun, error) {
 var connectionNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // sanitizeConnectionName normalizes a derived connection name: lowercase,
-// non-alphanumeric characters replaced with dashes.
+// non-alphanumeric characters replaced with dashes, leading dashes and
+// underscores stripped.
 func sanitizeConnectionName(name string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
@@ -44,7 +47,7 @@ func sanitizeConnectionName(name string) string {
 			b.WriteRune('-')
 		}
 	}
-	return b.String()
+	return strings.TrimLeft(b.String(), "-_")
 }
 
 // defaultNameFromFile derives a connection name from a configuration file
@@ -73,7 +76,14 @@ func LoadConfigSources(paths []string, infoAddr string) ([]*ConnectionSpec, erro
 				return nil, err
 			}
 			for _, e := range entries {
-				if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".conf") {
+				if !strings.HasSuffix(strings.ToLower(e.Name()), ".conf") {
+					continue
+				}
+				// Only load regular files: a FIFO named *.conf would
+				// otherwise hang startup on open, and directories or
+				// devices are never valid configurations.
+				if !e.Type().IsRegular() {
+					log.Printf("skipping non-regular file in config directory: %s\n", filepath.Join(p, e.Name()))
 					continue
 				}
 				files = append(files, filepath.Join(p, e.Name()))
@@ -110,6 +120,8 @@ func LoadConfigSources(paths []string, infoAddr string) ([]*ConnectionSpec, erro
 func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 	names := make(map[string]bool)
 	tsHostnames := make(map[string]string)
+	tsStateDirs := make(map[string]string)
+	wgListenPorts := make(map[int]string)
 
 	type bind struct {
 		kind  string
@@ -124,7 +136,7 @@ func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 		if err != nil {
 			return fmt.Errorf("invalid address %q: %w", addr, err)
 		}
-		binds = append(binds, bind{kind: kind, host: host, port: port, owner: owner})
+		binds = append(binds, bind{kind: kind, host: host, port: normalizePort(port), owner: owner})
 		return nil
 	}
 
@@ -135,7 +147,7 @@ func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 	}
 
 	for _, spec := range specs {
-		if !connectionNamePattern.MatchString(spec.Name) {
+		if spec.Name == "" || !connectionNamePattern.MatchString(spec.Name) {
 			return fmt.Errorf("connection %q: name must match %s", spec.Name, connectionNamePattern.String())
 		}
 		if names[spec.Name] {
@@ -150,25 +162,53 @@ func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 				return fmt.Errorf("connections %q and %q use the same Tailscale Hostname %q", prev, spec.Name, hostname)
 			}
 			tsHostnames[hostname] = spec.Name
+
+			stateDir := spec.Conf.Tailscale.EffectiveStateDir(spec.Name)
+			if prev, ok := tsStateDirs[stateDir]; ok && stateDir != "" {
+				return fmt.Errorf("connections %q and %q share the Tailscale StateDir %s", prev, spec.Name, stateDir)
+			}
+			tsStateDirs[stateDir] = spec.Name
 			if spec.Conf.Device != nil {
 				return fmt.Errorf("connection %q: [Interface] and [Tailscale] are mutually exclusive", spec.Name)
 			}
 		}
+		if spec.Conf.Device != nil && spec.Conf.Device.ListenPort != nil {
+			port := *spec.Conf.Device.ListenPort
+			if prev, ok := wgListenPorts[port]; ok {
+				return fmt.Errorf("connections %q and %q use the same WireGuard ListenPort %d", prev, spec.Name, port)
+			}
+			wgListenPorts[port] = spec.Name
+		}
 		for _, r := range spec.Conf.Routines {
 			switch rt := r.(type) {
 			case *TCPClientTunnelConfig:
-				addBind("tcp", rt.BindAddress.String(), spec.Name)
+				err := addBind("tcp", rt.BindAddress.String(), spec.Name)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
 			case *Socks5Config:
-				addBind("tcp", rt.BindAddress, spec.Name)
+				err := addBind("tcp", rt.BindAddress, spec.Name)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
 			case *HTTPConfig:
-				addBind("tcp", rt.BindAddress, spec.Name)
+				err := addBind("tcp", rt.BindAddress, spec.Name)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
 			case *SNIConfig:
-				addBind("tcp", rt.BindAddress, spec.Name)
+				err := addBind("tcp", rt.BindAddress, spec.Name)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
 			case *UDPProxyTunnelConfig:
 				if spec.Conf.Tailscale != nil {
 					return fmt.Errorf("connection %q: UDPProxyTunnel is not supported for Tailscale connections", spec.Name)
 				}
-				addBind("udp", rt.BindAddress, spec.Name)
+				err := addBind("udp", rt.BindAddress, spec.Name)
+				if err != nil {
+					return fmt.Errorf("connection %q: %w", spec.Name, err)
+				}
 			case *TCPServerTunnelConfig:
 				if listenPorts[rt.ListenPort] {
 					return fmt.Errorf("connection %q: TCPServerTunnel ListenPort %d used twice", spec.Name, rt.ListenPort)
@@ -191,7 +231,62 @@ func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 			}
 		}
 	}
+
 	return nil
+}
+
+// normalizePort strips leading zeros so that "08080" and "8080" compare
+// equal; non-numeric ports are returned unchanged (and rejected later by
+// the OS bind).
+func normalizePort(port string) string {
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return port
+	}
+	return strconv.Itoa(n)
+}
+
+// NeedsOpenEgress reports whether any connection requires outbound TCP to
+// arbitrary remote endpoints (Tailscale control/DERP traffic, or split
+// routing where non-matching destinations are dialed directly). The
+// Landlock TCP connect restriction cannot express such policies, so the
+// caller must skip it.
+func NeedsOpenEgress(specs []*ConnectionSpec) bool {
+	for _, spec := range specs {
+		if spec.Conf.Tailscale != nil {
+			return true
+		}
+		for _, r := range spec.Conf.Routines {
+			switch rt := r.(type) {
+			case *Socks5Config:
+				if len(rt.TunnelDomains) > 0 {
+					return true
+				}
+			case *HTTPConfig:
+				if len(rt.TunnelDomains) > 0 {
+					return true
+				}
+			case *SNIConfig:
+				if len(rt.TunnelDomains) > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// TailscaleStateDirs returns every effective state directory of all
+// Tailscale connections.
+func TailscaleStateDirs(specs []*ConnectionSpec) []string {
+	var dirs []string
+	for _, spec := range specs {
+		if spec.Conf.Tailscale == nil {
+			continue
+		}
+		dirs = append(dirs, spec.Conf.Tailscale.EffectiveStateDir(spec.Name))
+	}
+	return dirs
 }
 
 func isWildcardHost(host string) bool {

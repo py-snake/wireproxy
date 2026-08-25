@@ -157,15 +157,16 @@ func parseBase64KeyToHex(section *ini.Section, keyName string) (string, error) {
 
 	return result, nil
 }
-
 func encodeBase64ToHex(key string) (string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil {
-		return "", errors.New("invalid base64 string: " + key)
+		// Do not echo the value: it may be a mistyped private key.
+		return "", errors.New("invalid base64 key material")
 	}
 	if len(decoded) != 32 {
-		return "", errors.New("key should be 32 bytes: " + key)
+		return "", errors.New("key should be 32 bytes")
 	}
+
 	return hex.EncodeToString(decoded), nil
 }
 
@@ -480,10 +481,16 @@ func parseSocks5Config(section *ini.Section) (RoutineSpawner, error) {
 	}
 	config.BindAddress = bindAddress
 
-	username, _ := parseString(section, "Username")
+	username, err := parseString(section, "Username")
+	if err != nil {
+		return nil, err
+	}
 	config.Username = username
 
-	password, _ := parseString(section, "Password")
+	password, err := parseString(section, "Password")
+	if err != nil {
+		return nil, err
+	}
 	config.Password = password
 
 	tunnelDomains, err := parseRegexList(section, "TunnelDomains")
@@ -534,16 +541,28 @@ func parseHTTPConfig(section *ini.Section) (RoutineSpawner, error) {
 	}
 	config.BindAddress = bindAddress
 
-	username, _ := parseString(section, "Username")
+	username, err := parseString(section, "Username")
+	if err != nil {
+		return nil, err
+	}
 	config.Username = username
 
-	password, _ := parseString(section, "Password")
+	password, err := parseString(section, "Password")
+	if err != nil {
+		return nil, err
+	}
 	config.Password = password
 
-	certFile, _ := parseString(section, "CertFile")
+	certFile, err := parseString(section, "CertFile")
+	if err != nil {
+		return nil, err
+	}
 	config.CertFile = certFile
 
-	keyFile, _ := parseString(section, "KeyFile")
+	keyFile, err := parseString(section, "KeyFile")
+	if err != nil {
+		return nil, err
+	}
 	config.KeyFile = keyFile
 
 	tunnelDomains, err := parseRegexList(section, "TunnelDomains")
@@ -634,7 +653,7 @@ func newConnGroup(name string) *connGroup {
 // named "<group>.<Type>" belong to connection <group>; everything else
 // belongs to the default connection. The returned ini.Section is the
 // DEFAULT section holding root keys (e.g. WGConfig, Name).
-func splitIntoGroups(cfg *ini.File) (*ini.Section, []*connGroup) {
+func splitIntoGroups(cfg *ini.File) (*ini.Section, []*connGroup, error) {
 	root := cfg.Section(ini.DefaultSection)
 	groups := make([]*connGroup, 0, 1)
 	byName := make(map[string]*connGroup)
@@ -651,6 +670,12 @@ func splitIntoGroups(cfg *ini.File) (*ini.Section, []*connGroup) {
 		sectionType := name
 		if idx := strings.IndexByte(name, '.'); idx >= 0 {
 			groupName, sectionType = name[:idx], name[idx+1:]
+			// Group names feed logs, health keys and file-derived names:
+			// normalize them up front so different spellings cannot alias.
+			groupName = sanitizeConnectionName(groupName)
+			if groupName == "" {
+				return nil, nil, errors.New("invalid connection group name in section " + name)
+			}
 		}
 
 		g, ok := byName[groupName]
@@ -673,7 +698,7 @@ func splitIntoGroups(cfg *ini.File) (*ini.Section, []*connGroup) {
 			g.routines[sectionType] = append(g.routines[sectionType], section)
 		}
 	}
-	return root, groups
+	return root, groups, nil
 }
 
 // parseInterfaceSection fills device from a single [Interface] section.
@@ -854,6 +879,14 @@ func (g *connGroup) parse(sourcePath string, root *ini.Section) (*Configuration,
 		}
 	case 1:
 		if key, err := g.iface[0].GetKey("WGConfig"); err == nil {
+			// Mixing an import with inline keys is almost certainly a
+			// stale leftover; refuse rather than silently ignoring the
+			// inline identity.
+			for _, forbidden := range []string{"PrivateKey", "Address", "DNS"} {
+				if _, err := g.iface[0].GetKey(forbidden); err == nil {
+					return nil, errors.New("[Interface] must not combine WGConfig with inline " + forbidden)
+				}
+			}
 			externalPath = resolveWGConfigPath(key.String(), parentDir)
 		}
 	default:
@@ -888,14 +921,27 @@ func (g *connGroup) parse(sourcePath string, root *ini.Section) (*Configuration,
 }
 
 // appendRoutines parses all routine sections of the group in canonical order.
+// Unknown section types are an error: a typo like [Sokcs5] must never
+// silently drop a proxy from the configuration.
 func (g *connGroup) appendRoutines(conf *Configuration) (*Configuration, error) {
+	parsed := make(map[string]bool, len(routineParsers))
 	for _, rp := range routineParsers {
+		parsed[rp.sectionType] = true
 		for _, section := range g.routines[rp.sectionType] {
 			routine, err := rp.parse(section)
 			if err != nil {
 				return nil, err
 			}
 			conf.Routines = append(conf.Routines, routine)
+		}
+	}
+	for sectionType := range g.routines {
+		if !parsed[sectionType] {
+			conn := conf.Name
+			if conn == "" {
+				conn = "<default>"
+			}
+			return nil, errors.New("unknown section type [" + sectionType + "] in connection " + conn)
 		}
 	}
 	return conf, nil
@@ -934,7 +980,10 @@ func parseConfigSource(source []byte, sourcePath string) ([]*ConnectionSpec, err
 		return nil, err
 	}
 
-	root, groups := splitIntoGroups(cfg)
+	root, groups, err := splitIntoGroups(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	explicitName := ""
 	if key, err := root.GetKey("Name"); err == nil {

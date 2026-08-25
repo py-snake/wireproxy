@@ -2,10 +2,15 @@ package wireproxy
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 
 	ini "github.com/go-ini/ini"
 )
+
+// defaultStateDirBase is the parent directory used when StateDir is unset.
+const defaultStateDirBase = "tsnet"
 
 // TailscaleConfig holds the settings for an embedded Tailscale node
 // (tsnet). Connections of this kind are mutually exclusive with WireGuard
@@ -70,6 +75,21 @@ func parseTailscaleConfig(section *ini.Section) (*TailscaleConfig, error) {
 	}
 
 	return config, nil
+}
+
+// EffectiveStateDir returns the directory where this node persists its
+// state. An explicit StateDir wins; otherwise a deterministic per-connection
+// path under the user's config/cache dir is derived, so multiple nodes never
+// collide and sandboxing rules can be computed up front.
+func (c *TailscaleConfig) EffectiveStateDir(connName string) string {
+	if c.StateDir != "" {
+		return c.StateDir
+	}
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "wireproxy", defaultStateDirBase, connName)
 }
 
 func (c *TailscaleConfig) start(name string, logLevel int) (*VirtualTun, error) {

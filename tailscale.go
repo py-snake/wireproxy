@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"tailscale.com/tsnet"
 )
@@ -92,7 +93,13 @@ func (n *tsnetNetwork) LookupContextHost(ctx context.Context, host string) ([]st
 		}
 	}
 
-	return net.DefaultResolver.LookupHost(ctx, host)
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		// The tailnet peer list did not contain this name; surface why the
+		// system fallback was used to keep DNS misbehaviour debuggable.
+		fmt.Fprintf(os.Stderr, "[%s] DEBUG: %q not in tailnet peer list, system resolver said: %v\n", n.s.Hostname, host, err)
+	}
+	return addrs, err
 }
 
 // startTsnet boots an embedded Tailscale node and wraps it into a
@@ -101,12 +108,17 @@ func (n *tsnetNetwork) LookupContextHost(ctx context.Context, host string) ([]st
 func startTsnet(name string, conf *TailscaleConfig, logLevel int) (*VirtualTun, error) {
 	_ = logLevel
 
+	stateDir := conf.EffectiveStateDir(name)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, fmt.Errorf("creating state dir %s: %w", stateDir, err)
+	}
+
 	s := &tsnet.Server{
 		Hostname:      conf.Hostname,
 		AuthKey:       conf.AuthKey,
 		ControlURL:    conf.ControlURL,
 		Ephemeral:     conf.Ephemeral,
-		Dir:           conf.StateDir,
+		Dir:           stateDir,
 		AdvertiseTags: conf.AdvertiseTags,
 		UserLogf: func(format string, args ...any) {
 			log.New(os.Stderr, "["+name+"] ", log.LstdFlags).Printf(format, args...)
@@ -117,6 +129,39 @@ func startTsnet(name string, conf *TailscaleConfig, logLevel int) (*VirtualTun, 
 		_ = s.Close()
 		return nil, fmt.Errorf("starting tsnet node %q: %w", conf.Hostname, err)
 	}
+
+	// Wait briefly for the node to become usable so that "connection
+	// started" is meaningful and later dials do not block indefinitely.
+	// NeedsLogin (interactive auth pending) is accepted as started: the
+	// login URL has been printed and the node will come up when the user
+	// authorizes it.
+	gateCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	lc, err := s.LocalClient()
+	if err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("local api: %w", err)
+	}
+	for {
+		st, err := lc.Status(gateCtx)
+		if err != nil {
+			break // status unavailable; proceed optimistically
+		}
+		switch st.BackendState {
+		case "Running":
+			log.Printf("[%s] tsnet node running\n", name)
+			goto gated
+		case "NeedsLogin":
+			log.Printf("[%s] waiting for Tailscale login; authorize via the printed URL\n", name)
+			goto gated
+		}
+		select {
+		case <-gateCtx.Done():
+			goto gated
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+gated:
 
 	return &VirtualTun{
 		Name:           name,

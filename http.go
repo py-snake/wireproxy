@@ -98,6 +98,7 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	req, err := http.ReadRequest(rd)
 	if err != nil {
 		log.Printf("read request failed: %s\n", err)
+		_ = conn.Close()
 		return
 	}
 
@@ -109,6 +110,7 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		}
 		_ = resp.Write(conn)
 		log.Println(err)
+		_ = conn.Close()
 		return
 	}
 
@@ -121,14 +123,15 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	default:
 		_ = responseWith(req, http.StatusMethodNotAllowed).Write(conn)
 		log.Printf("unsupported protocol: %s\n", req.Method)
+		_ = conn.Close()
 		return
 	}
-	if err != nil {
+	if err != nil || peer == nil {
+		if peer == nil && err == nil {
+			err = fmt.Errorf("dial proxy failed: peer nil")
+		}
 		log.Printf("dial proxy failed: %s\n", err)
-		return
-	}
-	if peer == nil {
-		log.Println("dial proxy failed: peer nil")
+		_ = conn.Close()
 		return
 	}
 

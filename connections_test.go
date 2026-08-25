@@ -14,7 +14,10 @@ func mustParseFile(t *testing.T, config string) (*ini.File, *ini.Section, []*con
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, groups := splitIntoGroups(iniData)
+	root, groups, err := splitIntoGroups(iniData)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return iniData, root, groups
 }
 
