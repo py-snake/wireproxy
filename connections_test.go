@@ -281,8 +281,9 @@ func TestHealthRegistryAggregation(t *testing.T) {
 	}
 
 	snaps := reg.snapshot()
-	if len(snaps) != 2 || snaps[0].name != "wg1" || snaps[1].name != "ts1" {
-		t.Fatalf("snapshot incorrect: %+v", snaps)
+	// Snapshots are ordered by connection name for deterministic output.
+	if len(snaps) != 2 || snaps[0].name != "ts1" || snaps[1].name != "wg1" {
+		t.Fatalf("snapshot incorrect (want name-sorted): %+v", snaps)
 	}
 	if snaps[0].stale() {
 		t.Fatal("fresh ping must not be stale")

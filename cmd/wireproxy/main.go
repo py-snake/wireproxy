@@ -350,9 +350,19 @@ func main() {
 	}
 
 	readyOpts := lockOptions{
-		roFiles:          tlsFilePaths(specs),
-		rwDirs:           wireproxy.TailscaleStateDirs(specs),
-		needsWriteAccess: len(wireproxy.TailscaleStateDirs(specs)) > 0,
+		roFiles: tlsFilePaths(specs),
+	}
+	tsDirs := wireproxy.TailscaleStateDirs(specs)
+	if len(tsDirs) > 0 {
+		// Create state dirs before lockdown: Landlock rules must reference
+		// existing paths, and tsnet only creates them later.
+		for _, dir := range tsDirs {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				log.Fatalf("cannot create Tailscale state dir %s: %s\n", dir, err.Error())
+			}
+			readyOpts.rwDirs = append(readyOpts.rwDirs, dir)
+		}
+		readyOpts.needsWriteAccess = true
 	}
 	lock("ready", readyOpts)
 

@@ -47,7 +47,7 @@ func sanitizeConnectionName(name string) string {
 			b.WriteRune('-')
 		}
 	}
-	return strings.TrimLeft(b.String(), "-_")
+	return strings.Trim(b.String(), "-_")
 }
 
 // defaultNameFromFile derives a connection name from a configuration file
@@ -214,6 +214,12 @@ func ValidateConnections(specs []*ConnectionSpec, infoAddr string) error {
 					return fmt.Errorf("connection %q: TCPServerTunnel ListenPort %d used twice", spec.Name, rt.ListenPort)
 				}
 				listenPorts[rt.ListenPort] = true
+				// The target port feeds a Landlock ConnectTCP rule at
+				// startup; reject malformed targets here so --configtest
+				// catches what would otherwise only fail (or panic) later.
+				if _, _, err := net.SplitHostPort(rt.Target); err != nil {
+					return fmt.Errorf("connection %q: TCPServerTunnel target %q: %w", spec.Name, rt.Target, err)
+				}
 			}
 		}
 	}

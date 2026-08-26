@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -67,9 +68,11 @@ func (s pingSnapshot) stale() bool {
 
 func (h *HealthRegistry) snapshot() []pingSnapshot {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]pingSnapshot, len(h.conns))
-	for i, vt := range h.conns {
+	conns := append([]*VirtualTun(nil), h.conns...)
+	h.mu.Unlock()
+
+	out := make([]pingSnapshot, len(conns))
+	for i, vt := range conns {
 		vt.PingRecordLock.Lock()
 		records := make(map[string]uint64, len(vt.PingRecord))
 		for k, v := range vt.PingRecord {
@@ -83,6 +86,8 @@ func (h *HealthRegistry) snapshot() []pingSnapshot {
 			records:    records,
 		}
 	}
+	// Deterministic output independent of connection start order.
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
 }
 
@@ -130,11 +135,13 @@ func (h *HealthRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// snapshotConns copies the registered connections under lock.
+// snapshotConns copies the registered connections under lock, ordered by name.
 func (h *HealthRegistry) snapshotConns() []*VirtualTun {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]*VirtualTun(nil), h.conns...)
+	conns := append([]*VirtualTun(nil), h.conns...)
+	h.mu.Unlock()
+	sort.Slice(conns, func(i, j int) bool { return conns[i].Name < conns[j].Name })
+	return conns
 }
 
 // writeRedactedIpc writes an IPC dump to buf, hiding secrets.

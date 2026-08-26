@@ -5,7 +5,6 @@ import (
 	"context"
 	srand "crypto/rand"
 	"crypto/subtle"
-	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -118,10 +117,12 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	addrs_all := []netip.Addr{}
 
 	switch d.ResolveConfig.ResolveStrategy {
-	case "ipv4":
-		addrs_all = append(addrs_v4, addrs_v6...)
 	case "ipv6":
 		addrs_all = append(addrs_v6, addrs_v4...)
+	default:
+		// "ipv4", "auto" and any unset value: prefer IPv4, fall back to
+		// IPv6 rather than returning nothing.
+		addrs_all = append(addrs_v4, addrs_v6...)
 	}
 
 	if len(addrs_all) == 0 {
@@ -509,31 +510,16 @@ func (d VirtualTun) pingIPs() {
 				return
 			}
 
-			if addr.Is4() {
-				replyPing, ok := replyPacket.Body.(*icmp.Echo)
-				if !ok {
-					d.Errorf("failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
-					return
-				}
-				if !bytes.Equal(replyPing.Data, requestPing.Data) || replyPing.Seq != requestPing.Seq {
-					d.Errorf("failed to parse ping response from %s: invalid ping reply: %v\n", addr, replyPing)
-					return
-				}
+			// x/net parses echo replies for both protocols into
+			// *icmp.Echo when the protocol is known (1 or 58).
+			replyPing, ok := replyPacket.Body.(*icmp.Echo)
+			if !ok {
+				d.Errorf("failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
+				return
 			}
-
-			if addr.Is6() {
-				replyPing, ok := replyPacket.Body.(*icmp.RawBody)
-				if !ok {
-					d.Errorf("failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
-					return
-				}
-
-				seq := binary.BigEndian.Uint16(replyPing.Data[2:4])
-				pongBody := replyPing.Data[4:]
-				if !bytes.Equal(pongBody, requestPing.Data) || int(seq) != requestPing.Seq {
-					d.Errorf("failed to parse ping response from %s: invalid ping reply: %v\n", addr, replyPing)
-					return
-				}
+			if !bytes.Equal(replyPing.Data, requestPing.Data) || replyPing.Seq != requestPing.Seq {
+				d.Errorf("failed to parse ping response from %s: invalid ping reply: %v\n", addr, replyPing)
+				return
 			}
 
 			d.PingRecordLock.Lock()
@@ -549,15 +535,25 @@ func (d VirtualTun) StartPingIPs() {
 	}
 
 	d.PingRecordLock.Lock()
+	now := uint64(time.Now().Unix())
 	for _, addr := range d.Conf.CheckAlive {
-		d.PingRecord[addr.String()] = 0
+		// Seed with the current time instead of zero: /readyz must not
+		// report stale before the very first probe had a chance to run.
+		d.PingRecord[addr.String()] = now
 	}
 	d.PingRecordLock.Unlock()
 
 	go func() {
 		for {
 			d.pingIPs()
-			time.Sleep(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
+			// Floor the sleep so a misconfigured interval can never turn
+			// this into a busy loop (config validation already rejects
+			// values below 1 second).
+			interval := d.Conf.CheckAliveInterval
+			if interval < 1 {
+				interval = 1
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
 		}
 	}()
 }

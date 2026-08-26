@@ -32,7 +32,9 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		vt.Errorf("UDP proxy tunnel: could not listen on %s: %v", conf.BindAddress, err)
 		return
 	}
-	defer func() { _ = listener.Close() }()
+	// NOTE: SpawnRoutine returns immediately after starting the reader
+	// goroutine below; the listener is closed by that goroutine when the
+	// tunnel stops, not here.
 	vt.Logf("UDP proxy tunnel listening on %s, forwarding to %s", conf.BindAddress, conf.Target)
 
 	inactivityDur := time.Duration(conf.InactivityTimeout) * time.Second
@@ -101,10 +103,10 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 
 		sessionMu.Lock()
 		if existing, ok := sessions[srcAddr]; ok {
-			// Another goroutine won the race; drop our duplicate.
-			sessionMu.Unlock()
-			_ = remoteConn.Close()
 			existing.lastActive = time.Now()
+			sessionMu.Unlock()
+			// Another goroutine won the race; drop our duplicate.
+			_ = remoteConn.Close()
 			return existing, nil
 		}
 		sessions[srcAddr] = s
@@ -117,6 +119,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 
 	// Main loop to read from local client and forward to remote
 	go func() {
+		defer func() { _ = listener.Close() }()
 		buf := make([]byte, 64*1024) // typical max UDP size
 		for {
 			n, src, err := listener.ReadFromUDP(buf)
