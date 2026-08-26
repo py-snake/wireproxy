@@ -120,8 +120,9 @@ func lock(stage string, opts lockOptions) {
 		// impossible to grant write access later: Landlock layers intersect.
 	case "boot-daemon":
 	case "read-config":
-		// OpenBSD
-		pledgeOrPanic("stdio rpath inet dns")
+		// OpenBSD: pledge can only narrow, so wpath/cpath must survive this
+		// stage for the ready stage to re-request them (Tailscale state).
+		pledgeOrPanic("stdio rpath inet dns wpath cpath")
 	case "ready":
 		// no file access is allowed from now on, only networking
 		// OpenBSD

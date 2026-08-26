@@ -114,8 +114,7 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 		addrs_v6[i], addrs_v6[j] = addrs_v6[j], addrs_v6[i]
 	})
 
-	addrs_all := []netip.Addr{}
-
+	var addrs_all []netip.Addr
 	switch d.ResolveConfig.ResolveStrategy {
 	case "ipv6":
 		addrs_all = append(addrs_v6, addrs_v4...)

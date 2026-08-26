@@ -46,17 +46,26 @@ func parseTailscaleConfig(section *ini.Section) (*TailscaleConfig, error) {
 		return nil, err
 	}
 	if strings.TrimSpace(hostname) == "" {
-		return nil, errors.New("Hostname should not be empty")
+		return nil, errors.New("hostname must not be empty")
 	}
 	config.Hostname = hostname
 
-	authKey, _ := parseString(section, "AuthKey")
+	authKey, err := parseString(section, "AuthKey")
+	if err != nil {
+		return nil, err
+	}
 	config.AuthKey = authKey
 
-	controlURL, _ := parseString(section, "ControlURL")
+	controlURL, err := parseString(section, "ControlURL")
+	if err != nil {
+		return nil, err
+	}
 	config.ControlURL = controlURL
 
-	stateDir, _ := parseString(section, "StateDir")
+	stateDir, err := parseString(section, "StateDir")
+	if err != nil {
+		return nil, err
+	}
 	config.StateDir = stateDir
 
 	ephemeral, err := parseBoolKey(section, "Ephemeral")

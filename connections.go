@@ -35,8 +35,8 @@ func StartConnection(spec *ConnectionSpec, logLevel int) (*VirtualTun, error) {
 var connectionNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // sanitizeConnectionName normalizes a derived connection name: lowercase,
-// non-alphanumeric characters replaced with dashes, leading dashes and
-// underscores stripped.
+// non-alphanumeric characters replaced with dashes, then leading and
+// trailing dashes/underscores stripped.
 func sanitizeConnectionName(name string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(strings.TrimSpace(name)) {

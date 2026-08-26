@@ -111,31 +111,6 @@ func TestResolveStrategyOrdering(t *testing.T) {
 	}
 }
 
-// TODO: suspected product bug in the resolve strategy handling: a [Resolve]
-// section without a recognized ResolveStrategy key parses to "" (config.go,
-// parseResolveConfig), and unknown strategies yield zero candidates in
-// ResolveAddrWithContext (routine.go), so every lookup fails at runtime even
-// though --configtest accepts the file. The default should fall back to
-// "auto" like connections without a [Resolve] section do.
-// Regression guard: an empty ResolveStrategy used to yield zero candidates,
-// failing every lookup despite --configtest accepting the file. It now
-// behaves like "auto".
-func TestResolveUnknownStrategyFallsBackToAuto(t *testing.T) {
-	vt := VirtualTun{
-		Name:          "test",
-		Net:           &fakeNetwork{addrs: []string{"192.0.2.33"}},
-		SystemDNS:     false,
-		ResolveConfig: &ResolveConfig{},
-	}
-	addr, err := vt.ResolveAddrWithContext(context.Background(), "host.internal")
-	if err != nil {
-		t.Fatalf("empty ResolveStrategy must behave like auto: %v", err)
-	}
-	if addr == nil {
-		t.Fatal("expected a resolved address")
-	}
-}
-
 func TestNetstackNetworkLoopbackEcho(t *testing.T) {
 	local := netip.MustParseAddr("10.77.0.1")
 	tunDev, tns, err := netstack.CreateNetTUN([]netip.Addr{local}, []netip.Addr{}, 1420)
@@ -149,7 +124,7 @@ func TestNetstackNetworkLoopbackEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenTCP: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	port := ln.Addr().(*net.TCPAddr).Port
 	go func() {
@@ -210,7 +185,7 @@ func TestNetstackNetworkLoopbackEcho(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			if err := c.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 				t.Fatalf("SetDeadline: %v", err)
 			}

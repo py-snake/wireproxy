@@ -79,8 +79,9 @@ func (n *tsnetNetwork) LookupContextHost(ctx context.Context, host string) ([]st
 				if dnsName == "" && hostname == "" {
 					continue
 				}
-				if host != dnsName && host != hostname &&
-					!(dnsName != "" && strings.HasSuffix(dnsName, "."+host)) {
+				matched := host == dnsName || host == hostname ||
+					(dnsName != "" && strings.HasSuffix(dnsName, "."+host))
+				if !matched {
 					continue
 				}
 				for _, ip := range p.TailscaleIPs {
