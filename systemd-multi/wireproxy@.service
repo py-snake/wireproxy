@@ -1,0 +1,30 @@
+[Unit]
+Description=wireproxy - multi-VPN SOCKS5/HTTP proxy (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/local/bin/wireproxy -c /etc/wireproxy/%i.conf -i 127.0.0.1:0
+Restart=on-failure
+RestartSec=5
+# Security hardening (matches wireproxy's built-in sandboxing)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# Allow network for wireproxy
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
