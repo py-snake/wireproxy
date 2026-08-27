@@ -210,6 +210,25 @@ WGConfig = <path to the wireguard config>
 ...
 ```
 
+You can override specific Interface fields from the imported file:
+
+```ini
+WGConfig = /etc/wireproxy/my-vpn.conf
+
+[Interface]
+MTU = 1240            ; override the imported MTU
+DNS = 1.1.1.1         ; override DNS
+CheckAlive = 1.1.1.1  ; add health monitoring
+CheckAliveInterval = 10
+
+[Socks5]
+BindAddress = 127.0.0.1:1084
+```
+
+Override fields: `MTU`, `DNS`, `ListenPort`, `CheckAlive`, `CheckAliveInterval`.
+Identity fields (`PrivateKey`, `Address`) cannot be overridden — they must
+come from the imported file.
+
 Having multiple peers is also supported. `AllowedIPs` would need to be specified
 such that wireproxy would know which peer to forward to.
 
@@ -333,33 +352,236 @@ logs an error and keeps serving the remaining connections.
 
 # Tailscale support
 
-Binaries built with `-tags tsnet` accept `[Tailscale]` sections, which embed a
-Tailscale node in the process using [tsnet](https://tailscale.com/kb/1244/tsnet):
+Wireproxy can embed a Tailscale node inside the process using
+[tsnet](https://tailscale.com/kb/1244/tsnet). This lets you expose
+SOCKS5/HTTP proxies and tunnels that dial **into your tailnet** (or
+listen **on the tailnet** for other peers) — all without requiring a
+system Tailscale installation.
 
-```ini
-[Tailscale]                      # or [mytail.Tailscale] as a named group
-Hostname = wireproxy-node        # node name registered in your tailnet
-AuthKey = $TS_AUTHKEY            # optional; omit for interactive login URL
-ControlURL =                     ; empty = Tailscale cloud; set for Headscale
-Ephemeral = false
-StateDir = $HOME/.local/share/wireproxy/tsnet-wireproxy-node
-AdvertiseTags = tag:proxy        ; optional ACL tags
+## How it works
 
-[Socks5]
-BindAddress = 127.0.0.1:1084     # dials INTO the tailnet
+```
+┌─────────────────────────────────────────────┐
+│  wireproxy process (no root, no TUN device) │
+│                                             │
+│  ┌──────────┐   ┌────────────────────────┐  │
+│  │ tsnet    │   │ SOCKS5 / HTTP / Tunnel │  │
+│  │ node ◄───┼───┤ proxy routines         │  │
+│  └────┬─────┘   └────────────────────────┘  │
+│       │                                     │
+└───────┼─────────────────────────────────────┘
+        │  tsnet dials through the Tailscale
+        │  overlay network (DERP + WireGuard)
+        ▼
+   Tailnet peers / MagicDNS / internet
 ```
 
-All proxy/tunnel types work against a Tailscale connection with the same
-semantics as WireGuard:
+Unlike WireGuard mode, the tsnet node is a full Tailscale client:
+it handles key exchange, DERP relaying, and MagicDNS internally.
+The proxy routines dial hostnames like `nas.tail1234.ts.net` and
+tsnet resolves them through the Tailscale peer list.
 
-- `Socks5`, `HTTP`, `SNI`, `TCPClientTunnel`, `STDIOTunnel`: dial tailnet
-  addresses/MagicDNS names (use `TunnelDomains` to pin a proxy to specific
-  peers, e.g. `TunnelDomains = ^nas\.tail1234\.ts\.net$`).
-- `TCPServerTunnel`: listens **on the tailnet** so other peers can reach a
-  local service.
-- Not supported: `UDPProxyTunnel`, `CheckAlive` (ICMP), `/metrics`.
+## Prerequisites
 
-See [examples/tailscale.conf](examples/tailscale.conf).
+- **Tailscale account**: free at [login.tailscale.com](https://login.tailscale.com).
+- **Optional**: [Headscale](https://headscale.net/) self-hosted control server.
+
+## Step 1: Build with tsnet support
+
+```bash
+make wireproxy-tsnet
+```
+
+This compiles with `-tags tsnet` and produces a binary that accepts
+`[Tailscale]` config sections. The binary is ~30 MB (vs ~15 MB without).
+
+To verify tsnet is enabled:
+
+```bash
+./wireproxy-tsnet --version
+# should print something like: v1.0.8-dev-tsnet
+```
+
+Without `-tags tsnet`, a `[Tailscale]` section still **validates**
+(`--configtest` passes), but starting the connection fails with:
+
+```
+this binary was built without Tailscale support; rebuild with `-tags tsnet`
+```
+
+## Step 2: Get a Tailscale auth key
+
+Go to [Tailscale admin console](https://login.tailscale.com/admin/settings/keys)
+and generate an **auth key** (Settings → Keys → Generate auth key).
+
+- Check **Reusable** if you want to start multiple nodes with the same key.
+- Check **Ephemeral** if the node should auto-remove after disconnect.
+
+Export the key:
+
+```bash
+export TS_AUTHKEY="tskey-auth-..."
+```
+
+Or write it directly in the config (less secure):
+
+```ini
+AuthKey = tskey-auth-...
+```
+
+## Step 3: Write the config
+
+```ini
+[Tailscale]
+Hostname = wireproxy-proxy
+AuthKey = $TS_AUTHKEY          ; env interpolation works everywhere
+ControlURL =                   ; empty = Tailscale cloud; set URL for Headscale
+Ephemeral = false
+StateDir = $HOME/.local/share/wireproxy/tsnet-proxy
+
+[Socks5]
+BindAddress = 127.0.0.1:1084
+
+[http]
+BindAddress = 127.0.0.1:1085
+```
+
+See [examples/tailscale.conf](examples/tailscale.conf) for a full
+reference.
+
+## Step 4: Start
+
+```bash
+./wireproxy-tsnet -c tailscale.conf
+```
+
+**First run without AuthKey** prints a login URL to stderr:
+
+```
+[proxy] waiting for Tailscale login; authorize via the printed URL
+[proxy] To authenticate, visit:
+  https://login.tailscale.com/a/abcdef1234567890
+```
+
+Open the URL in a browser and authorize the node. Once authorized,
+the connection comes up automatically. State is persisted in `StateDir`
+so subsequent starts skip the login step.
+
+With an AuthKey, the node starts immediately:
+
+```
+[proxy] tsnet node running
+```
+
+## Step 5: Use the proxy
+
+Point your application at the SOCKS5 or HTTP proxy:
+
+```bash
+# SOCKS5
+curl -x socks5://127.0.0.1:1084 http://nas.tail1234.ts.net:5000/api/data
+
+# HTTP
+curl -x http://127.0.0.1:1085 http://nas.tail1234.ts.net/api/data
+
+# System-wide (Linux)
+export ALL_PROXY=socks5://127.0.0.1:1084
+```
+
+Any hostname in your tailnet (MagicDNS names, Tailscale IPs) resolves
+through tsnet and routes via the Tailscale overlay.
+
+## Headscale (self-hosted) configuration
+
+To use a Headscale server instead of Tailscale cloud, set `ControlURL`:
+
+```ini
+[Tailscale]
+Hostname = wireproxy-proxy
+AuthKey = $HS_AUTHKEY
+ControlURL = https://hs.example.com:8080
+```
+
+The `ControlURL` is the base URL of your Headscale instance (no trailing slash).
+
+## Mixing WireGuard and Tailscale
+
+You can run WireGuard and Tailscale connections side-by-side:
+
+```bash
+./wireproxy-tsnet -c wg.conf -c tailscale.conf -i 127.0.0.1:9080
+```
+
+Or in a single named-group config:
+
+```ini
+[netguard.Socks5]
+BindAddress = 127.0.0.1:1081
+
+[netguard.Tailscale]
+Hostname = wireproxy-ng
+AuthKey = $TS_AUTHKEY
+
+[warp.Socks5]
+BindAddress = 127.0.0.1:1082
+
+[warp.Interface]
+WGConfig = /etc/wireproxy/wgcf-profile.conf
+
+[Resolve]
+ResolveStrategy = ipv4
+```
+
+Each connection gets its own health entry in `/readyz` and `/metrics`.
+
+## Listening on the tailnet
+
+Use `TCPServerTunnel` to expose a local service to other tailnet peers:
+
+```ini
+[Tailscale]
+Hostname = wireproxy-server
+AuthKey = $TS_AUTHKEY
+
+[TCPServerTunnel]
+ListenPort = 8080
+Target = localhost:3000
+```
+
+Other tailnet peers can now reach `wireproxy-server:8080` directly.
+
+## Limitations
+
+| Feature | WireGuard | Tailscale (tsnet) |
+|---|---|---|
+| TCPClientTunnel / STDIOTunnel | Yes | Yes |
+| TCPServerTunnel | Yes | Yes (on tailnet) |
+| Socks5 / HTTP / SNI | Yes | Yes |
+| UDPProxyTunnel | Yes | **No** |
+| CheckAlive (ICMP ping) | Yes | **No** |
+| /metrics details | Full `wg show` | Basic (no handshake data) |
+| TunnelDomains filtering | Yes | Yes |
+| Build required | `-tags wireguard` (default) | `-tags tsnet` |
+
+## Troubleshooting
+
+**"this binary was built without Tailscale support"**
+Rebuild with `make wireproxy-tsnet`.
+
+**Node stuck in "Starting" state**
+Check that `ControlURL` is correct (leave empty for Tailscale cloud).
+Ensure outbound UDP (DERP) is not blocked by a firewall.
+
+**Auth expired / node unauthorized**
+Delete the `StateDir` contents and restart. A new login URL will be printed.
+
+**MagicDNS names not resolving**
+Verify the hostname you're querying exists in your tailnet.
+The `LookupContextHost` function first checks the Tailscale peer list,
+then falls back to the system resolver.
+
+See [examples/tailscale.conf](examples/tailscale.conf) for a complete
+working example.
 
 # Health endpoint
 
