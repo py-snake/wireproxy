@@ -793,10 +793,8 @@ func (g *connGroup) parse(sourcePath string, root *ini.Section) (*Configuration,
 		}
 	case 1:
 		if key, err := g.iface[0].GetKey("WGConfig"); err == nil {
-			// Mixing an import with inline keys is almost certainly a
-			// stale leftover; refuse rather than silently ignoring the
-			// inline identity.
-			for _, forbidden := range []string{"PrivateKey", "Address", "DNS"} {
+			// Allow specific override fields alongside WGConfig
+			for _, forbidden := range []string{"PrivateKey", "Address"} {
 				if _, err := g.iface[0].GetKey(forbidden); err == nil {
 					return nil, errors.New("[Interface] must not combine WGConfig with inline " + forbidden)
 				}
@@ -818,6 +816,12 @@ func (g *connGroup) parse(sourcePath string, root *ini.Section) (*Configuration,
 		if err := ParsePeers(wgCfg, &device.Peers); err != nil {
 			return nil, err
 		}
+		// Apply overrides from the wrapper's [Interface] section (if present)
+		if len(g.iface) == 1 {
+			if err := applyInterfaceOverrides(g.iface[0], device); err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		if err := parseInterfaceSection(g.iface[0], device); err != nil {
 			return nil, err
@@ -832,6 +836,58 @@ func (g *connGroup) parse(sourcePath string, root *ini.Section) (*Configuration,
 	conf.Device = device
 
 	return g.appendRoutines(conf)
+}
+
+// applyInterfaceOverrides applies specific fields from a wrapper's [Interface]
+// section to override values imported via WGConfig. Only specific fields
+// are allowed to be overridden: MTU, DNS, ListenPort, CheckAlive, CheckAliveInterval.
+func applyInterfaceOverrides(section *ini.Section, device *DeviceConfig) error {
+	// MTU override
+	if sectionKey, err := section.GetKey("MTU"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		device.MTU = value
+	}
+
+	// DNS override
+	if _, err := section.GetKey("DNS"); err == nil {
+		dns, err := parseNetIP(section, "DNS")
+		if err != nil {
+			return err
+		}
+		device.DNS = dns
+	}
+
+	// ListenPort override
+	if sectionKey, err := section.GetKey("ListenPort"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		device.ListenPort = &value
+	}
+
+	// CheckAlive override
+	if _, err := section.GetKey("CheckAlive"); err == nil {
+		checkAlive, err := parseNetIP(section, "CheckAlive")
+		if err != nil {
+			return err
+		}
+		device.CheckAlive = checkAlive
+	}
+
+	// CheckAliveInterval override
+	if sectionKey, err := section.GetKey("CheckAliveInterval"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		device.CheckAliveInterval = value
+	}
+
+	return nil
 }
 
 // appendRoutines parses all routine sections of the group in canonical order.
